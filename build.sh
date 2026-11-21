@@ -61,7 +61,9 @@ PY
 
 zipalign -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
-# 5. sign
+# 5. sign AFTER zipalign, with apksigner (v1+v2+v3).
+# jarsigner after zipalign would break the 4-byte alignment required by
+# Android 11+ (targetSdk 30+) for resources.arsc.
 if [ ! -f "$TOOLS/debug.jks" ]; then
   keytool -genkeypair -v -keystore "$TOOLS/debug.jks" \
     -alias pswitch -keyalg RSA -keysize 2048 -validity 10000 \
@@ -69,9 +71,37 @@ if [ ! -f "$TOOLS/debug.jks" ]; then
     -dname "CN=PSwitch, OU=Modding, O=PSwitch, L=NA, S=NA, C=NA" >/dev/null 2>&1
 fi
 cp "$OUT/aligned.apk" "$ROOT/PSwitch.apk"
-jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
-  -keystore "$TOOLS/debug.jks" -storepass android -keypass android \
-  "$ROOT/PSwitch.apk" pswitch >/dev/null 2>&1
+
+APKSIGNER_JAR=""
+for p in "$HOME"/android-sdk/build-tools/*/lib/apksigner.jar; do
+  if [ -f "$p" ]; then APKSIGNER_JAR="$p"; break; fi
+done
+
+if [ -n "$APKSIGNER_JAR" ]; then
+  java -cp "$APKSIGNER_JAR" com.android.apksigner.ApkSignerTool sign \
+    --ks "$TOOLS/debug.jks" \
+    --ks-pass pass:android \
+    --key-pass pass:android \
+    --ks-key-alias pswitch \
+    --min-sdk-version 26 \
+    --v1-signing-enabled true \
+    --v2-signing-enabled true \
+    --v3-signing-enabled true \
+    --v4-signing-enabled false \
+    "$ROOT/PSwitch.apk"
+else
+  apksigner sign \
+    --ks "$TOOLS/debug.jks" \
+    --ks-pass pass:android \
+    --key-pass pass:android \
+    --ks-key-alias pswitch \
+    --min-sdk-version 26 \
+    --v1-signing-enabled true \
+    --v2-signing-enabled true \
+    --v3-signing-enabled true \
+    --v4-signing-enabled false \
+    "$ROOT/PSwitch.apk"
+fi
 
 ls -lh "$ROOT/PSwitch.apk"
 echo "BUILD OK"

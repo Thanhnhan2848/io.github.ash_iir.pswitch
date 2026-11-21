@@ -38,9 +38,10 @@ the compile-only `libxposed:api:102.0.0` classes automatically:
 bash build.sh
 ```
 
-The signed APK is written to `PSwitch.apk`. You still need `aapt2`, an Android `android.jar`,
-D8/R8 and `zipalign` available in your `PATH`; adjust the tool paths in `build.sh` for your
-environment.
+The signed APK is written to `PSwitch.apk`. Signing is done with `apksigner` **after**
+`zipalign` so `resources.arsc` stays 4-byte aligned (required by Android 11+ / targetSdk 30+).
+You still need `aapt2`, an Android `android.jar`, D8/R8 and `zipalign` available in your
+`PATH`; adjust the tool paths in `build.sh` for your environment.
 
 ## Disclaimer
 
