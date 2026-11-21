@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.ash_iir.pswitch"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-permission android:name="android.permission.GET_ACCOUNTS" />
+
+    <!-- Android 11+ package visibility: required to see Google accounts. -->
+    <queries>
+        <package android:name="com.google.android.gsf" />
+        <package android:name="com.google.android.gms" />
+    </queries>
+
+    <application
+        android:label="PSwitch"
+        android:description="@string/module_description"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="PSwitch">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name=".TargetProvider"
+            android:authorities="io.github.ash_iir.pswitch.provider"
+            android:exported="true" />
+
+        <receiver
+            android:name=".AccountsCacheReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.ash_iir.pswitch.ACCOUNTS" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

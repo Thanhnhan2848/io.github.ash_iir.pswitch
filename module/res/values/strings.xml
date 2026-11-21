@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="pswitch_app_name">PSwitch</string>
+    <string name="module_description">Switch the Google account used by Google Play Store for in-app purchases, with a root-free account picker.</string>
+</resources>
