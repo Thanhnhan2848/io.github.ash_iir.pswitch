@@ -13,16 +13,16 @@ import android.util.Log;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import io.github.libxposed.api.XposedInterface;
-import io.github.libxposed.api.XposedInterface.Chain;
-import io.github.libxposed.api.XposedInterface.Hooker;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam;
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
@@ -31,9 +31,15 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
  * PSwitch entry for the modern libxposed API 102.
  *
  * Forces the Google account used by Google Play Store (Finsky) for billing /
- * in-app purchases to the one chosen in the companion app. No root is needed:
- * the app publishes the choice through an exported ContentProvider, and a
- * broadcast applies changes instantly to a running Play Store process.
+ * in-app purchases to the one chosen in the companion app.
+ *
+ * PATCHED (shape-based resolution):
+ * - Class names of Finsky internals churn between releases; "poc" survived but
+ *   its method names did not (NoSuchMethodException: poc#a on 54.3.08).
+ * - Methods are now located by signature shape first, exact name second.
+ * - Every hook installs independently; one failure no longer kills the rest.
+ * - On any ambiguity the full method/field table of the class is dumped to the
+ *   log so the exact names can be pinned without guessing.
  */
 public class XposedInit extends XposedModule {
 
@@ -71,8 +77,8 @@ public class XposedInit extends XposedModule {
     private static boolean hooked;
     private static Class<?> szfClass;
 
-    private static final Set<String> triedLoaders = new HashSet<String>();
-    private static final Set<String> loggedLookups = new HashSet<String>();
+    private static final Set<String> triedLoaders = new HashSet<>();
+    private static final Set<String> loggedLookups = new HashSet<>();
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -179,163 +185,285 @@ public class XposedInit extends XposedModule {
     private static synchronized void installHooks(final Class<?> poc, String source) {
         if (hooked)
             return;
+        boolean any = false;
+
+        // ---- poc: exact legacy names first, shape-based fallback second ----
+        Method acctFromName = null;
+        Method acctNoArg = null;
+        Method nameNoArg = null;
         try {
-            final ClassLoader cl = poc.getClassLoader();
+            acctFromName = findMethod(poc, "a", String.class);
+            logI("poc#a(String) exact hit");
+        } catch (Throwable t) {
+            logW("poc#a(String) gone: " + t);
+        }
+        try {
+            acctNoArg = findMethod(poc, "b");
+            logI("poc#b() exact hit");
+        } catch (Throwable t) {
+            logW("poc#b() gone: " + t);
+        }
+        try {
+            nameNoArg = findMethod(poc, "f");
+            logI("poc#f() exact hit");
+        } catch (Throwable t) {
+            logW("poc#f() gone: " + t);
+        }
 
-            final Method pocA = findMethod(poc, "a", String.class);
-            final Method pocB = findMethod(poc, "b");
-            final Method pocF = findMethod(poc, "f");
+        Method[] shape = resolvePocByShape(poc);
+        if (acctFromName == null) acctFromName = shape[0];
+        if (acctNoArg == null) acctNoArg = shape[1];
+        if (nameNoArg == null) nameNoArg = shape[2];
 
-            // Main IAP source. Replacing the result avoids calling the original at all.
-            hookMethod(pocA).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    if (pocInstance == null)
-                        pocInstance = chain.getThisObject();
-                    if (!accountsSent && appContext != null) {
-                        accountsSent = true;
-                        sendAccounts(appContext);
-                    }
-                    String target = readTarget();
-                    if (target == null)
-                        return chain.proceed();
-                    Object requested = chain.getArg(0);
-                    logOnce("lookup:" + requested,
-                            "poc.a(\"" + requested + "\") -> " + target);
-                    return targetAccount(chain.getThisObject(), target);
-                }
-            });
-
-            hookMethod(pocB).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    if (pocInstance == null)
-                        pocInstance = chain.getThisObject();
-                    String target = readTarget();
-                    if (target == null)
-                        return chain.proceed();
-                    return targetAccount(chain.getThisObject(), target);
-                }
-            });
-
-            hookMethod(pocF).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    String target = readTarget();
-                    if (target == null)
-                        return chain.proceed();
-                    return target;
-                }
-            });
-
-            // Belt-and-suspenders: force the resolved account object itself.
+        if (acctFromName != null) {
+            final Method m = acctFromName;
             try {
-                final Class<?> wfm = Class.forName(WFM, false, cl);
-                final Class<?> tbj = Class.forName(TBJ, false, cl);
-                final Class<?> tct = Class.forName(TCT, false, cl);
-                Class<?> optionalCls;
-                try {
-                    optionalCls = Class.forName("j$.util.Optional", false, cl);
-                } catch (Throwable e) {
-                    optionalCls = java.util.Optional.class;
-                }
-                final Method wfmB = findMethod(wfm, "b", tbj, optionalCls,
-                        Context.class, boolean.class);
-                hookMethod(wfmB).intercept(new Hooker() {
+                // Main IAP source. Replacing the result avoids calling the original.
+                hookMethod(m).intercept(new Hooker() {
                     @Override
                     public Object intercept(Chain chain) throws Throwable {
-                        Object result = chain.proceed();
-                        String target = readTarget();
-                        if (target == null || result == null || !tct.isInstance(result))
-                            return result;
-                        Object current = getField(result, "a");
-                        if (current instanceof Account
-                                && target.equals(((Account) current).name))
-                            return result;
-                        setField(result, "a", targetAccount(chain.getThisObject(), target));
-                        logOnce("wfm.b", "wfm.b forced tct.a -> " + target);
-                        return result;
-                    }
-                });
-                logI("hooked wfm.b");
-            } catch (Throwable t) {
-                logW("wfm.b hook failed: " + t);
-            }
-
-            // Checkout account also lives in szf.c and in the purchase Bundle.
-            try {
-                szfClass = Class.forName(SZF, false, cl);
-                final java.lang.reflect.Constructor<?> ctor =
-                        szfClass.getDeclaredConstructor(Context.class, Bundle.class);
-                hookMethod(ctor).intercept(new Hooker() {
-                    @Override
-                    public Object intercept(Chain chain) throws Throwable {
-                        Object result = chain.proceed();
-                        String target = readTarget();
-                        if (target != null)
-                            setField(chain.getThisObject(), "c", target);
-                        return result;
-                    }
-                });
-                logI("hooked szf constructor");
-            } catch (Throwable t) {
-                logW("szf hook failed: " + t);
-            }
-
-            final Class<?> szfRef = szfClass;
-            if (szfRef != null) {
-                try {
-                    final Class<?> sky = Class.forName(SKY, false, cl);
-                    final Method accept = findMethod(sky, "accept", Object.class);
-                    hookMethod(accept).intercept(new Hooker() {
-                        @Override
-                        public Object intercept(Chain chain) throws Throwable {
-                            Object result = chain.proceed();
-                            String target = readTarget();
-                            if (target == null || chain.getThisObject() == null)
-                                return result;
-                            Object owner = getField(chain.getThisObject(), "a");
-                            if (owner == null || !szfRef.isInstance(owner))
-                                return result;
-                            Object current = getField(owner, "c");
-                            if (!target.equals(current)) {
-                                setField(owner, "c", target);
-                                logOnce("sky", "sky forced szf.c -> " + target);
-                            }
-                            return result;
+                        if (pocInstance == null)
+                            pocInstance = chain.getThisObject();
+                        if (!accountsSent && appContext != null) {
+                            accountsSent = true;
+                            sendAccounts(appContext);
                         }
-                    });
-                    logI("hooked sky.accept");
-                } catch (Throwable t) {
-                    logW("sky hook failed: " + t);
-                }
+                        String target = readTarget();
+                        if (target == null)
+                            return chain.proceed();
+                        Object requested = chain.getArg(0);
+                        logOnce("lookup:" + requested,
+                                "poc.a(\"" + requested + "\") -> " + target);
+                        return targetAccount(chain.getThisObject(), target);
+                    }
+                });
+                logI("hooked " + poc.getName() + "#" + m.getName() + "(String)");
+                any = true;
+            } catch (Throwable t) {
+                logE("poc.a hook failed: " + t);
             }
+        } else {
+            logE("poc: no (String)->Account method resolvable, dump follows");
+        }
 
+        if (acctNoArg != null) {
+            final Method m = acctNoArg;
             try {
-                final Class<?> sxk = Class.forName(SXK, false, cl);
-                final Method save = findMethod(sxk, "onSaveInstanceState", Bundle.class);
-                hookMethod(save).intercept(new Hooker() {
+                hookMethod(m).intercept(new Hooker() {
+                    @Override
+                    public Object intercept(Chain chain) throws Throwable {
+                        if (pocInstance == null)
+                            pocInstance = chain.getThisObject();
+                        String target = readTarget();
+                        if (target == null)
+                            return chain.proceed();
+                        return targetAccount(chain.getThisObject(), target);
+                    }
+                });
+                logI("hooked " + poc.getName() + "#" + m.getName() + "():Account");
+                any = true;
+            } catch (Throwable t) {
+                logE("poc.b hook failed: " + t);
+            }
+        }
+
+        if (nameNoArg != null) {
+            final Method m = nameNoArg;
+            try {
+                hookMethod(m).intercept(new Hooker() {
+                    @Override
+                    public Object intercept(Chain chain) throws Throwable {
+                        String target = readTarget();
+                        if (target == null)
+                            return chain.proceed();
+                        return target;
+                    }
+                });
+                logI("hooked " + poc.getName() + "#" + m.getName() + "():String");
+                any = true;
+            } catch (Throwable t) {
+                logE("poc.f hook failed: " + t);
+            }
+        }
+
+        // ---- checkout account in szf.c (best effort, independent) ----
+        try {
+            szfClass = Class.forName(SZF, false, poc.getClassLoader());
+            final Constructor<?> ctor =
+                    szfClass.getDeclaredConstructor(Context.class, Bundle.class);
+            hookMethod(ctor).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    String target = readTarget();
+                    if (target != null)
+                        setField(chain.getThisObject(), "c", target);
+                    return result;
+                }
+            });
+            logI("hooked szf constructor");
+            any = true;
+        } catch (Throwable t) {
+            logW("szf hook failed: " + t);
+        }
+
+        // ---- force the resolved account object itself (wfm.b) ----
+        try {
+            final Class<?> wfm = Class.forName(WFM, false, poc.getClassLoader());
+            final Class<?> tbj = Class.forName(TBJ, false, poc.getClassLoader());
+            final Class<?> tct = Class.forName(TCT, false, poc.getClassLoader());
+            Class<?> optionalCls;
+            try {
+                optionalCls = Class.forName("j$.util.Optional", false, poc.getClassLoader());
+            } catch (Throwable e) {
+                optionalCls = java.util.Optional.class;
+            }
+            final Method wfmB = findMethod(wfm, "b", tbj, optionalCls,
+                    Context.class, boolean.class);
+            hookMethod(wfmB).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    String target = readTarget();
+                    if (target == null || result == null || !tct.isInstance(result))
+                        return result;
+                    Object current = getField(result, "a");
+                    if (current instanceof Account
+                            && target.equals(((Account) current).name))
+                        return result;
+                    setField(result, "a", targetAccount(chain.getThisObject(), target));
+                    logOnce("wfm.b", "wfm.b forced tct.a -> " + target);
+                    return result;
+                }
+            });
+            logI("hooked wfm.b");
+            any = true;
+        } catch (Throwable t) {
+            logW("wfm.b hook failed: " + t);
+        }
+
+        // ---- sky.accept forces szf.c on updates ----
+        if (szfClass != null) {
+            try {
+                final Class<?> sky = Class.forName(SKY, false, poc.getClassLoader());
+                final Method accept = findMethod(sky, "accept", Object.class);
+                hookMethod(accept).intercept(new Hooker() {
                     @Override
                     public Object intercept(Chain chain) throws Throwable {
                         Object result = chain.proceed();
                         String target = readTarget();
-                        if (target == null || chain.getArg(0) == null)
+                        if (target == null || chain.getThisObject() == null)
                             return result;
-                        if (chain.getArg(0) instanceof Bundle)
-                            ((Bundle) chain.getArg(0)).putString(BILLING_EXTRA, target);
+                        Object owner = getField(chain.getThisObject(), "a");
+                        if (owner == null || !szfClass.isInstance(owner))
+                            return result;
+                        Object current = getField(owner, "c");
+                        if (!target.equals(current)) {
+                            setField(owner, "c", target);
+                            logOnce("sky", "sky forced szf.c -> " + target);
+                        }
                         return result;
                     }
                 });
-                logI("hooked sxk.onSaveInstanceState");
+                logI("hooked sky.accept");
+                any = true;
             } catch (Throwable t) {
-                logW("sxk hook failed: " + t);
+                logW("sky hook failed: " + t);
             }
+        }
 
+        // ---- sxk.onSaveInstanceState keeps the BillingAccountModel extra ----
+        try {
+            final Class<?> sxk = Class.forName(SXK, false, poc.getClassLoader());
+            final Method save = findMethod(sxk, "onSaveInstanceState", Bundle.class);
+            hookMethod(save).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    String target = readTarget();
+                    if (target == null || chain.getArg(0) == null)
+                        return result;
+                    if (chain.getArg(0) instanceof Bundle)
+                        ((Bundle) chain.getArg(0)).putString(BILLING_EXTRA, target);
+                    return result;
+                }
+            });
+            logI("hooked sxk.onSaveInstanceState");
+            any = true;
+        } catch (Throwable t) {
+            logW("sxk hook failed: " + t);
+        }
+
+        if (any) {
             hooked = true;
             logI("Finsky account hooks installed via " + source);
-        } catch (Throwable t) {
-            logE("installHooks failed via " + source + ": " + t);
+        } else {
+            logE("installHooks: nothing resolved via " + source + ", full dump follows");
         }
+        dumpClass(poc, POC);
+    }
+
+    /**
+     * Locate the poc methods by shape instead of name:
+     *   [0] resolver: instance (String) -> Account   (legacy a)
+     *   [1] current:  instance () -> Account          (legacy b)
+     *   [2] default:  instance () -> String           (legacy f)
+     * A slot stays null when zero or several candidates match (ambiguous shape
+     * is never hooked blindly — check the dump instead).
+     */
+    private static Method[] resolvePocByShape(Class<?> poc) {
+        List<Method> byName = new ArrayList<>();
+        List<Method> curAcct = new ArrayList<>();
+        List<Method> curName = new ArrayList<>();
+        for (Method m : poc.getDeclaredMethods()) {
+            if (Modifier.isStatic(m.getModifiers()) || m.isBridge() || m.isSynthetic())
+                continue;
+            Class<?> ret = m.getReturnType();
+            Class<?>[] ps = m.getParameterTypes();
+            if (ps.length == 1 && ps[0] == String.class
+                    && Account.class.isAssignableFrom(ret))
+                byName.add(m);
+            else if (ps.length == 0 && Account.class.isAssignableFrom(ret))
+                curAcct.add(m);
+            else if (ps.length == 0 && ret == String.class)
+                curName.add(m);
+        }
+        logShapeCandidates("name->Account", byName);
+        logShapeCandidates("()->Account", curAcct);
+        logShapeCandidates("()->String", curName);
+        return new Method[]{
+                byName.size() == 1 ? byName.get(0) : null,
+                curAcct.size() == 1 ? curAcct.get(0) : null,
+                curName.size() == 1 ? curName.get(0) : null
+        };
+    }
+
+    private static void logShapeCandidates(String what, List<Method> ms) {
+        StringBuilder sb = new StringBuilder("shape [" + what + "] "
+                + ms.size() + " candidate(s):");
+        for (Method m : ms) {
+            sb.append(' ').append(m.getName()).append('(');
+            Class<?>[] ps = m.getParameterTypes();
+            for (int i = 0; i < ps.length; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(ps[i].getName());
+            }
+            sb.append(")->").append(m.getReturnType().getName());
+        }
+        logI(sb.toString());
+    }
+
+    /** Full table of declared methods + fields, so the exact names are known. */
+    private static void dumpClass(Class<?> c, String label) {
+        StringBuilder sb = new StringBuilder("dump " + label + " " + c.getName() + ":");
+        for (Method m : c.getDeclaredMethods()) {
+            sb.append("\n  ").append(m.toString());
+        }
+        for (Field f : c.getDeclaredFields()) {
+            sb.append("\n  field ").append(f.getType().getName())
+                    .append(' ').append(f.getName());
+        }
+        logI(sb.toString());
     }
 
     private static void registerReceivers(Context ctx) {
@@ -373,7 +501,7 @@ public class XposedInit extends XposedModule {
 
     /** Play Store can see every Google account; send the list to the app. */
     private static void sendAccounts(Context ctx) {
-        List<String> names = new ArrayList<String>();
+        List<String> names = new ArrayList<>();
         Object list = callMethod(pocInstance, "i");
         if (list instanceof List) {
             for (Object o : (List<?>) list) {
@@ -490,7 +618,8 @@ public class XposedInit extends XposedModule {
         if (self != null) self.log(Log.ERROR, TAG, msg); else Log.e(TAG, msg);
     }
 
-    private static XposedInterface.HookBuilder hookMethod(java.lang.reflect.Executable executable) {
+    private static XposedInterface.HookBuilder hookMethod(
+            java.lang.reflect.Executable executable) {
         return self.hook(executable);
     }
 
