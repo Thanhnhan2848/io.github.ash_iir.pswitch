@@ -34,6 +34,8 @@ public class XposedInit extends XposedModule {
 
     private static final String TAG = "PSwitch";
     private static final String VENDING = "com.android.vending";
+    private static final String GOOGLE_ONE = "com.google.android.apps.subscriptions.red";
+    private static final String MAIHOKU = "io.github.xiaotong6666.maihoku";
     private static final String APP_PACKAGE = "io.github.ash_iir.pswitch";
 
     private static final String TARGET_FILE =
@@ -57,6 +59,8 @@ public class XposedInit extends XposedModule {
     private static XposedInit self;
     private static Context appContext;
     private static ClassLoader packageLoader;
+    private static String currentPackage;
+    private static boolean isVendingProcess;
 
     private static volatile String overrideTarget;
     private static volatile boolean hasOverride;
@@ -83,11 +87,14 @@ public class XposedInit extends XposedModule {
 
     @Override
     public void onPackageReady(PackageReadyParam param) {
-        if (!VENDING.equals(param.getPackageName())) {
+        String pkg = param.getPackageName();
+        if (APP_PACKAGE.equals(pkg)) {
             return;
         }
+        currentPackage = pkg;
+        isVendingProcess = VENDING.equals(pkg);
         packageLoader = param.getClassLoader();
-        logI("onPackageReady: " + param.getPackageName());
+        logI("onPackageReady: " + pkg);
 
         hookApplication();
         hookAccountManager();
@@ -113,16 +120,15 @@ public class XposedInit extends XposedModule {
                             return res;
                         }
                     });
-            logI("Hooked Application.onCreate");
+            logI("Hooked Application.onCreate in " + currentPackage);
         } catch (Throwable t) {
             logE("hookApplication failed: " + t);
         }
     }
 
     /**
-     * Layer 2: Cô lập tài khoản Google trên AccountManager (chỉ trả về duy nhất tài khoản đã chọn
-     * cho Play Store, giữ nguyên đủ tài khoản cho app PSwitch) + tự dò class kho tài khoản thật
-     * của Finsky qua stack trace.
+     * Layer 2: Cô lập tài khoản Google trên AccountManager cho tất cả app trong Scope
+     * (Play Store, Google One, MaiHoku...), chỉ trả về duy nhất tài khoản đã chọn.
      */
     private void hookAccountManager() {
         try {
@@ -144,7 +150,9 @@ public class XposedInit extends XposedModule {
                     if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
                         return raw;
                     }
-                    discoverFromStackTrace(new Throwable().getStackTrace());
+                    if (isVendingProcess) {
+                        discoverFromStackTrace(new Throwable().getStackTrace());
+                    }
                     String target = readTarget();
                     if (target == null) {
                         return raw;
@@ -171,7 +179,9 @@ public class XposedInit extends XposedModule {
                     if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
                         return raw;
                     }
-                    discoverFromStackTrace(new Throwable().getStackTrace());
+                    if (isVendingProcess) {
+                        discoverFromStackTrace(new Throwable().getStackTrace());
+                    }
                     String target = readTarget();
                     if (target == null) {
                         return raw;
@@ -203,7 +213,9 @@ public class XposedInit extends XposedModule {
                     if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
                         return raw;
                     }
-                    discoverFromStackTrace(new Throwable().getStackTrace());
+                    if (isVendingProcess) {
+                        discoverFromStackTrace(new Throwable().getStackTrace());
+                    }
                     String target = readTarget();
                     if (target == null) {
                         return raw;
@@ -252,15 +264,15 @@ public class XposedInit extends XposedModule {
         List<Account> out = new ArrayList<>(1 + nonGoogle.size());
         out.add(matched);
         out.addAll(nonGoogle);
-        logOnce("isolate:" + src + ":" + target,
-                "Isolated Google account to [" + target + "] via " + src
-                        + " (was " + original.length + " accounts)");
+        logOnce("isolate:" + currentPackage + ":" + src + ":" + target,
+                "[" + currentPackage + "] Isolated Google account to [" + target + "] via "
+                        + src + " (was " + original.length + " accounts)");
         return out.toArray(new Account[out.size()]);
     }
 
     /**
-     * Layer 3: Chặn TRƯỚC khi bất kỳ dòng code onCreate() nào của Activity thanh toán chạy,
-     * ghi đè thực sự vào mExtras bằng intent.replaceExtras(extras).
+     * Layer 3: Chặn TRƯỚC khi onCreate() của Activity chạy để ghi đè Intent/Bundle thực sự
+     * (áp dụng cho cả Play Store, Google One và MaiHoku).
      */
     private void hookActivityLaunch() {
         try {
@@ -334,8 +346,9 @@ public class XposedInit extends XposedModule {
         String clsName = act.getClass().getName();
         Intent intent = act.getIntent();
         if (intent != null) {
-            if (clsName.contains("billing") || clsName.contains("acquire")
-                    || clsName.contains("purchase")) {
+            if (isVendingProcess && (clsName.contains("billing")
+                    || clsName.contains("acquire")
+                    || clsName.contains("purchase"))) {
                 dumpIntentExtrasOnce(clsName, intent);
             }
             patchIntent(intent, target, clsName + "#intent");
@@ -375,7 +388,6 @@ public class XposedInit extends XposedModule {
                 return;
             }
             if (patchBundle(extras, target, where)) {
-                // Ghi ngược Bundle đã sửa vào Intent thật
                 intent.replaceExtras(extras);
             }
         } catch (Throwable t) {
@@ -451,7 +463,7 @@ public class XposedInit extends XposedModule {
 
     /**
      * Layer 4: Tự động dò class AccountRepository thật của Finsky từ stack trace khi
-     * Play Store gọi AccountManager, rồi hook trực tiếp các hàm không-abstract của nó.
+     * Play Store gọi AccountManager.
      */
     private static void discoverFromStackTrace(StackTraceElement[] frames) {
         ClassLoader cl = appContext != null ? appContext.getClassLoader() : packageLoader;
@@ -733,15 +745,17 @@ public class XposedInit extends XposedModule {
                         hasOverride = true;
                         cachedProvider = email;
                         providerCached = true;
-                        logI("Broadcast target -> " + overrideTarget);
-                    } else if (ACTION_REQUEST.equals(action)) {
+                        logI("[" + currentPackage + "] Broadcast target -> " + overrideTarget);
+                    } else if (ACTION_REQUEST.equals(action) && isVendingProcess) {
                         sendAccounts(c);
                     }
                 }
             };
             IntentFilter filter = new IntentFilter();
             filter.addAction(ACTION_SET);
-            filter.addAction(ACTION_REQUEST);
+            if (isVendingProcess) {
+                filter.addAction(ACTION_REQUEST);
+            }
             try {
                 Method m = Context.class.getMethod("registerReceiver",
                         BroadcastReceiver.class, IntentFilter.class, int.class);
@@ -749,7 +763,7 @@ public class XposedInit extends XposedModule {
             } catch (Throwable old) {
                 ctx.registerReceiver(receiver, filter);
             }
-            logI("Receivers registered");
+            logI("Receivers registered in " + currentPackage);
         } catch (Throwable t) {
             logE("registerReceivers failed: " + t);
         }
@@ -809,7 +823,10 @@ public class XposedInit extends XposedModule {
         if (providerCached) {
             return fromProvider;
         }
-        return readFile();
+        if (isVendingProcess) {
+            return readFile();
+        }
+        return null;
     }
 
     private static String readProvider() {
