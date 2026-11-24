@@ -8,8 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      PREFIX: /usr
     steps:
       - uses: actions/checkout@v4
 
@@ -20,30 +18,33 @@ jobs:
 
       - name: Install Android SDK build tools
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" > /dev/null
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
-          ln -sfn "$ANDROID_HOME" "$HOME/android-sdk"
-          mkdir -p "$HOME/Android"
-          ln -sfn "$ANDROID_HOME" "$HOME/Android/Sdk"
-          sudo mkdir -p /usr/share/java
-          D8_JAR=$(find "$ANDROID_HOME" -name "d8.jar" | head -n 1)
-          APKSIGNER_JAR=$(find "$ANDROID_HOME" -name "apksigner.jar" | head -n 1)
-          echo "Found D8_JAR=$D8_JAR"
-          echo "Found APKSIGNER_JAR=$APKSIGNER_JAR"
-          [ -n "$D8_JAR" ] && sudo ln -sf "$D8_JAR" /usr/share/java/d8.jar
-          [ -n "$APKSIGNER_JAR" ] && sudo ln -sf "$APKSIGNER_JAR" /usr/share/java/apksigner.jar
+          SDK_DIR="$HOME/android-sdk"
+          mkdir -p "$SDK_DIR"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_DIR" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_DIR" "build-tools;34.0.0" > /dev/null
+          echo "$SDK_DIR/build-tools/34.0.0" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Fetch compile-only android.jar
+      - name: Fetch compile-only android.jar and patch build.sh
         run: |
           mkdir -p tools
           curl -fsSL -o tools/android-4.1.1.4.jar \
             https://repo1.maven.org/maven2/com/google/android/android/4.1.1.4/android-4.1.1.4.jar
+          REAL_D8=$(find "$HOME/android-sdk" -name "d8.jar" | head -n 1)
+          REAL_APKSIGNER=$(find "$HOME/android-sdk" -name "apksigner.jar" | head -n 1)
+          cp -f "$REAL_D8" tools/d8.jar
+          cp -f "$REAL_APKSIGNER" tools/apksigner.jar
+          REAL_D8="$REAL_D8" REAL_APKSIGNER="$REAL_APKSIGNER" python3 -c '
+          import os, re
+          s = open("build.sh").read()
+          s = re.sub(r"[\"\x27]?[^\s\"\x27]*d8\.jar[\"\x27]?", "\"" + os.environ["REAL_D8"] + "\"", s)
+          s = re.sub(r"[\"\x27]?[^\s\"\x27]*apksigner\.jar[\"\x27]?", "\"" + os.environ["REAL_APKSIGNER"] + "\"", s)
+          open("build.sh", "w").write(s)
+          '
 
       - name: Build
-        run: |
-          cat -n build.sh
-          bash build.sh
+        run: bash build.sh
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
