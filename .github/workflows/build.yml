@@ -20,8 +20,12 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" > /dev/null
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
-          ln -sfn "$ANDROID_HOME" "$HOME/android-sdk"
+          mkdir -p "$HOME/android-sdk/build-tools"
+          ln -sfn "$ANDROID_HOME/build-tools/34.0.0" "$HOME/android-sdk/build-tools/34.0.0"
+          [ -f "$ANDROID_HOME/build-tools/34.0.0/lib/d8.jar" ] && ln -sf "$ANDROID_HOME/build-tools/34.0.0/lib/d8.jar" "$ANDROID_HOME/build-tools/34.0.0/d8.jar"
+          echo "$HOME/android-sdk/build-tools/34.0.0" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
 
       - name: Fetch compile-only android.jar
         run: |
@@ -30,7 +34,9 @@ jobs:
             https://repo1.maven.org/maven2/com/google/android/android/4.1.1.4/android-4.1.1.4.jar
 
       - name: Build
-        run: bash build.sh
+        run: |
+          sed -i -E 's|build-tools/[0-9]+\.[0-9]+\.[0-9]+|build-tools/34.0.0|g' build.sh
+          bash build.sh
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
