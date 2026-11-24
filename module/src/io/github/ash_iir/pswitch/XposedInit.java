@@ -4,6 +4,7 @@ import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.app.Activity;
 import android.app.Application;
+import android.app.Instrumentation;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -15,7 +16,6 @@ import android.util.Log;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -56,9 +56,7 @@ public class XposedInit extends XposedModule {
 
     private static XposedInit self;
     private static Context appContext;
-    private static volatile Object repoInstance;
-    private static volatile Method repoAccountsListMethod;
-    private static volatile boolean accountsSent;
+    private static ClassLoader packageLoader;
 
     private static volatile String overrideTarget;
     private static volatile boolean hasOverride;
@@ -66,6 +64,10 @@ public class XposedInit extends XposedModule {
     private static volatile long cachedVersion = -1;
     private static volatile boolean providerCached;
 
+    private static final ThreadLocal<Boolean> bypassAccountFilter = new ThreadLocal<>();
+
+    private static final Set<String> knownGoogleEmails =
+            Collections.synchronizedSet(new HashSet<String>());
     private static final Set<String> inspectedClasses =
             Collections.synchronizedSet(new HashSet<String>());
     private static final Set<String> hookedMethods =
@@ -84,17 +86,16 @@ public class XposedInit extends XposedModule {
         if (!VENDING.equals(param.getPackageName())) {
             return;
         }
+        packageLoader = param.getClassLoader();
         logI("onPackageReady: " + param.getPackageName());
 
         hookApplication();
         hookAccountManager();
-        hookActivityBillingExtras();
-        hookClassLoader();
-        hookFinskyClasses(param.getClassLoader());
+        hookActivityLaunch();
     }
 
     /**
-     * Layer 1: Application.onCreate -> giữ Context để đọc ContentProvider và nhận Broadcast.
+     * Layer 1: Giữ Context để đọc ContentProvider và đăng ký BroadcastReceiver.
      */
     private void hookApplication() {
         try {
@@ -108,7 +109,6 @@ public class XposedInit extends XposedModule {
                             if (app instanceof Context) {
                                 appContext = (Context) app;
                                 registerReceivers(appContext);
-                                hookFinskyClasses(appContext.getClassLoader());
                             }
                             return res;
                         }
@@ -120,7 +120,9 @@ public class XposedInit extends XposedModule {
     }
 
     /**
-     * Layer 2: Đưa tài khoản Google mục tiêu lên vị trí đầu tiên (index 0) trong AccountManager.
+     * Layer 2: Cô lập tài khoản Google trên AccountManager (chỉ trả về duy nhất tài khoản đã chọn
+     * cho Play Store, giữ nguyên đủ tài khoản cho app PSwitch) + tự dò class kho tài khoản thật
+     * của Finsky qua stack trace.
      */
     private void hookAccountManager() {
         try {
@@ -137,11 +139,17 @@ public class XposedInit extends XposedModule {
                     if (arg0 != null && !"com.google".equals(arg0.toString())) {
                         return res;
                     }
+                    Account[] raw = (Account[]) res;
+                    recordKnownEmails(raw);
+                    if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
+                        return raw;
+                    }
+                    discoverFromStackTrace(new Throwable().getStackTrace());
                     String target = readTarget();
                     if (target == null) {
-                        return res;
+                        return raw;
                     }
-                    return promoteTargetAccount((Account[]) res, target, "getAccountsByType");
+                    return isolateTargetAccount(raw, target, true, "getAccountsByType");
                 }
             });
             logI("Hooked AccountManager.getAccountsByType");
@@ -158,11 +166,17 @@ public class XposedInit extends XposedModule {
                     if (!(res instanceof Account[])) {
                         return res;
                     }
+                    Account[] raw = (Account[]) res;
+                    recordKnownEmails(raw);
+                    if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
+                        return raw;
+                    }
+                    discoverFromStackTrace(new Throwable().getStackTrace());
                     String target = readTarget();
                     if (target == null) {
-                        return res;
+                        return raw;
                     }
-                    return promoteTargetAccount((Account[]) res, target, "getAccounts");
+                    return isolateTargetAccount(raw, target, false, "getAccounts");
                 }
             });
             logI("Hooked AccountManager.getAccounts");
@@ -184,11 +198,17 @@ public class XposedInit extends XposedModule {
                     if (arg0 != null && !"com.google".equals(arg0.toString())) {
                         return res;
                     }
+                    Account[] raw = (Account[]) res;
+                    recordKnownEmails(raw);
+                    if (Boolean.TRUE.equals(bypassAccountFilter.get())) {
+                        return raw;
+                    }
+                    discoverFromStackTrace(new Throwable().getStackTrace());
                     String target = readTarget();
                     if (target == null) {
-                        return res;
+                        return raw;
                     }
-                    return promoteTargetAccount((Account[]) res, target, "getAccountsByTypeForPackage");
+                    return isolateTargetAccount(raw, target, true, "getAccountsByTypeForPackage");
                 }
             });
             logI("Hooked AccountManager.getAccountsByTypeForPackage");
@@ -196,78 +216,108 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    private static Account[] promoteTargetAccount(Account[] original, String target, String src) {
-        if (original == null || original.length <= 1) {
-            return original;
+    private static void recordKnownEmails(Account[] accounts) {
+        if (accounts == null) {
+            return;
         }
-        int foundIdx = -1;
-        for (int i = 0; i < original.length; i++) {
-            Account a = original[i];
-            if (a != null && "com.google".equals(a.type) && target.equalsIgnoreCase(a.name)) {
-                foundIdx = i;
-                break;
+        for (Account a : accounts) {
+            if (a != null && "com.google".equals(a.type) && a.name != null) {
+                knownGoogleEmails.add(a.name.toLowerCase());
             }
         }
-        if (foundIdx <= 0) {
+    }
+
+    private static Account[] isolateTargetAccount(
+            Account[] original, String target, boolean googleOnly, String src) {
+        if (original == null || original.length == 0) {
             return original;
         }
-        Account[] reordered = new Account[original.length];
-        reordered[0] = original[foundIdx];
-        int pos = 1;
-        for (int i = 0; i < original.length; i++) {
-            if (i != foundIdx) {
-                reordered[pos++] = original[i];
+        Account matched = null;
+        List<Account> nonGoogle = new ArrayList<>();
+        for (Account a : original) {
+            if (a == null) {
+                continue;
+            }
+            if ("com.google".equals(a.type)) {
+                if (target.equalsIgnoreCase(a.name)) {
+                    matched = a;
+                }
+            } else if (!googleOnly) {
+                nonGoogle.add(a);
             }
         }
-        logOnce("promote:" + src + ":" + target,
-                "Promoted " + target + " to index 0 via " + src);
-        return reordered;
+        if (matched == null) {
+            return original;
+        }
+        List<Account> out = new ArrayList<>(1 + nonGoogle.size());
+        out.add(matched);
+        out.addAll(nonGoogle);
+        logOnce("isolate:" + src + ":" + target,
+                "Isolated Google account to [" + target + "] via " + src
+                        + " (was " + original.length + " accounts)");
+        return out.toArray(new Account[out.size()]);
     }
 
     /**
-     * Layer 3: Ghi đè tài khoản thanh toán trong Intent & Bundle khi mở màn hình IAP.
+     * Layer 3: Chặn TRƯỚC khi bất kỳ dòng code onCreate() nào của Activity thanh toán chạy,
+     * ghi đè thực sự vào mExtras bằng intent.replaceExtras(extras).
      */
-    private void hookActivityBillingExtras() {
+    private void hookActivityLaunch() {
         try {
-            Method onCreate = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
-            hookMethod(onCreate).setPriority(XposedInterface.PRIORITY_HIGHEST)
+            Method callOnCreate = Instrumentation.class.getDeclaredMethod(
+                    "callActivityOnCreate", Activity.class, Bundle.class);
+            hookMethod(callOnCreate).setPriority(XposedInterface.PRIORITY_HIGHEST)
                     .intercept(new Hooker() {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
-                            String target = readTarget();
-                            if (target != null && chain.getThisObject() instanceof Activity) {
-                                Activity act = (Activity) chain.getThisObject();
-                                Intent intent = act.getIntent();
-                                if (intent != null && intent.getExtras() != null) {
-                                    patchBundle(intent.getExtras(), target,
-                                            act.getClass().getName() + "#intent");
-                                }
-                                Object arg0 = chain.getArg(0);
-                                if (arg0 instanceof Bundle) {
-                                    patchBundle((Bundle) arg0, target,
-                                            act.getClass().getName() + "#savedState");
-                                }
+                            Object arg0 = chain.getArg(0);
+                            Object arg1 = chain.getArg(1);
+                            if (arg0 instanceof Activity) {
+                                handleActivityBeforeCreate((Activity) arg0,
+                                        arg1 instanceof Bundle ? (Bundle) arg1 : null);
                             }
                             return chain.proceed();
                         }
                     });
-            logI("Hooked Activity.onCreate(Bundle)");
+            logI("Hooked Instrumentation.callActivityOnCreate(Activity,Bundle)");
         } catch (Throwable t) {
-            logE("hookActivityBillingExtras failed: " + t);
+            logE("hook callActivityOnCreate failed: " + t);
         }
 
         try {
-            Method onNewIntent = Activity.class.getDeclaredMethod("onNewIntent", Intent.class);
+            Class<?> pbCls = Class.forName("android.os.PersistableBundle");
+            Method callOnCreate3 = Instrumentation.class.getDeclaredMethod(
+                    "callActivityOnCreate", Activity.class, Bundle.class, pbCls);
+            hookMethod(callOnCreate3).setPriority(XposedInterface.PRIORITY_HIGHEST)
+                    .intercept(new Hooker() {
+                        @Override
+                        public Object intercept(Chain chain) throws Throwable {
+                            Object arg0 = chain.getArg(0);
+                            Object arg1 = chain.getArg(1);
+                            if (arg0 instanceof Activity) {
+                                handleActivityBeforeCreate((Activity) arg0,
+                                        arg1 instanceof Bundle ? (Bundle) arg1 : null);
+                            }
+                            return chain.proceed();
+                        }
+                    });
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Method onNewIntent = Instrumentation.class.getDeclaredMethod(
+                    "callActivityOnNewIntent", Activity.class, Intent.class);
             hookMethod(onNewIntent).setPriority(XposedInterface.PRIORITY_HIGHEST)
                     .intercept(new Hooker() {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
+                            Object arg0 = chain.getArg(0);
+                            Object arg1 = chain.getArg(1);
                             String target = readTarget();
-                            if (target != null && chain.getArg(0) instanceof Intent) {
-                                Intent intent = (Intent) chain.getArg(0);
-                                if (intent.getExtras() != null) {
-                                    patchBundle(intent.getExtras(), target, "onNewIntent");
-                                }
+                            if (target != null && arg1 instanceof Intent) {
+                                String where = (arg0 != null ? arg0.getClass().getName() : "Act")
+                                        + "#newIntent";
+                                patchIntent((Intent) arg1, target, where);
                             }
                             return chain.proceed();
                         }
@@ -276,110 +326,192 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    private static void patchBundle(Bundle b, String target, String where) {
-        if (b == null) {
+    private static void handleActivityBeforeCreate(Activity act, Bundle savedState) {
+        String target = readTarget();
+        if (target == null || act == null) {
             return;
         }
-        for (String key : BILLING_KEYS) {
-            if (b.containsKey(key)) {
-                String oldVal = b.getString(key);
-                if (oldVal != null && !target.equalsIgnoreCase(oldVal)) {
+        String clsName = act.getClass().getName();
+        Intent intent = act.getIntent();
+        if (intent != null) {
+            if (clsName.contains("billing") || clsName.contains("acquire")
+                    || clsName.contains("purchase")) {
+                dumpIntentExtrasOnce(clsName, intent);
+            }
+            patchIntent(intent, target, clsName + "#intent");
+        }
+        if (savedState != null) {
+            patchBundle(savedState, target, clsName + "#savedState");
+        }
+    }
+
+    private static void dumpIntentExtrasOnce(String clsName, Intent intent) {
+        if (!loggedOnce.add("dumpIntent:" + clsName)) {
+            return;
+        }
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder("Intent extras for " + clsName + ":");
+            for (String k : extras.keySet()) {
+                Object v = extras.get(k);
+                String t = v == null ? "null" : v.getClass().getSimpleName();
+                sb.append("\n  ").append(k).append(" (").append(t).append(")");
+                if (v instanceof String || v instanceof Account) {
+                    sb.append(" = ").append(v);
+                }
+            }
+            logI(sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void patchIntent(Intent intent, String target, String where) {
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null) {
+                return;
+            }
+            if (patchBundle(extras, target, where)) {
+                // Ghi ngược Bundle đã sửa vào Intent thật
+                intent.replaceExtras(extras);
+            }
+        } catch (Throwable t) {
+            logW("patchIntent failed for " + where + ": " + t);
+        }
+    }
+
+    private static boolean patchBundle(Bundle b, String target, String where) {
+        if (b == null) {
+            return false;
+        }
+        boolean modified = false;
+        Set<String> keys;
+        try {
+            keys = new HashSet<>(b.keySet());
+        } catch (Throwable t) {
+            return false;
+        }
+        for (String key : keys) {
+            Object val;
+            try {
+                val = b.get(key);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            if (val instanceof String) {
+                String s = (String) val;
+                if (!target.equalsIgnoreCase(s)
+                        && (isBillingKey(key) || isOtherKnownGoogleEmail(s, target))) {
                     b.putString(key, target);
-                    logOnce("bundle:" + where + ":" + key,
-                            "Patched " + where + " [" + key + "]: " + oldVal + " -> " + target);
+                    modified = true;
+                    logI("Patched " + where + " [" + key + "]: " + s + " -> " + target);
+                }
+            } else if (val instanceof Account) {
+                Account a = (Account) val;
+                if ("com.google".equals(a.type) && !target.equalsIgnoreCase(a.name)) {
+                    b.putParcelable(key, resolveTargetAccount(target));
+                    modified = true;
+                    logI("Patched Account " + where + " [" + key + "]: " + a.name + " -> " + target);
+                }
+            } else if (val instanceof Bundle) {
+                if (patchBundle((Bundle) val, target, where + "." + key)) {
+                    modified = true;
+                }
+            }
+        }
+        return modified;
+    }
+
+    private static boolean isBillingKey(String key) {
+        if (key == null) {
+            return false;
+        }
+        for (String k : BILLING_KEYS) {
+            if (k.equals(key)) {
+                return true;
+            }
+        }
+        String low = key.toLowerCase();
+        return low.contains("accountname") || low.contains("account_name")
+                || low.contains("authaccount");
+    }
+
+    private static boolean isOtherKnownGoogleEmail(String val, String target) {
+        if (val == null || val.indexOf('@') <= 0) {
+            return false;
+        }
+        if (target.equalsIgnoreCase(val)) {
+            return false;
+        }
+        return knownGoogleEmails.contains(val.toLowerCase());
+    }
+
+    /**
+     * Layer 4: Tự động dò class AccountRepository thật của Finsky từ stack trace khi
+     * Play Store gọi AccountManager, rồi hook trực tiếp các hàm không-abstract của nó.
+     */
+    private static void discoverFromStackTrace(StackTraceElement[] frames) {
+        ClassLoader cl = appContext != null ? appContext.getClassLoader() : packageLoader;
+        if (cl == null || frames == null) {
+            return;
+        }
+        StringBuilder chainLog = new StringBuilder();
+        for (StackTraceElement f : frames) {
+            String cn = f.getClassName();
+            if (cn == null
+                    || cn.startsWith("java.")
+                    || cn.startsWith("javax.")
+                    || cn.startsWith("android.")
+                    || cn.startsWith("dalvik.")
+                    || cn.startsWith("com.android.internal.")
+                    || cn.startsWith("io.github.")
+                    || cn.startsWith("LSPHooker")) {
+                continue;
+            }
+            if (chainLog.length() > 0) {
+                chainLog.append(" <- ");
+            }
+            chainLog.append(cn).append('#').append(f.getMethodName());
+            try {
+                Class<?> cls = Class.forName(cn, false, cl);
+                inspectHierarchy(cls, 1);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (chainLog.length() > 0) {
+            logOnce("am_stack:" + chainLog, "AccountManager stack: " + chainLog);
+        }
+    }
+
+    private static void inspectHierarchy(Class<?> cls, int depth) {
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            inspectCandidateClass(c);
+            if (depth > 0) {
+                try {
+                    for (Field f : c.getDeclaredFields()) {
+                        Class<?> ft = f.getType();
+                        String fn = ft.getName();
+                        if (!ft.isPrimitive() && !ft.isArray() && !ft.isInterface()
+                                && (fn.indexOf('.') < 0 || fn.startsWith("com.google.android.finsky"))) {
+                            inspectCandidateClass(ft);
+                        }
+                    }
+                } catch (Throwable ignored) {
                 }
             }
         }
     }
 
-    /**
-     * Layer 4: Tự động quét & hook class quản lý tài khoản của Finsky (poc và các class obfuscated khác)
-     * dựa theo chữ ký kiểu dữ liệu, không phụ thuộc tên hàm cố định.
-     */
-    private void hookClassLoader() {
-        try {
-            hookMethod(ClassLoader.class.getDeclaredMethod(
-                    "loadClass", String.class, boolean.class))
-                    .intercept(new Hooker() {
-                        @Override
-                        public Object intercept(Chain chain) throws Throwable {
-                            Object res = chain.proceed();
-                            if (res instanceof Class) {
-                                inspectCandidateClass((Class<?>) res);
-                            }
-                            return res;
-                        }
-                    });
-        } catch (Throwable t) {
-            logD("loadClass(String,boolean) hook failed: " + t);
-        }
-
-        try {
-            hookMethod(ClassLoader.class.getDeclaredMethod("loadClass", String.class))
-                    .intercept(new Hooker() {
-                        @Override
-                        public Object intercept(Chain chain) throws Throwable {
-                            Object res = chain.proceed();
-                            if (res instanceof Class) {
-                                inspectCandidateClass((Class<?>) res);
-                            }
-                            return res;
-                        }
-                    });
-        } catch (Throwable t) {
-            logD("loadClass(String) hook failed: " + t);
-        }
-    }
-
-    private void hookFinskyClasses(ClassLoader cl) {
-        if (cl == null) {
+    private static void inspectCandidateClass(Class<?> cls) {
+        if (cls == null || cls.isInterface() || cls.isPrimitive() || cls.isArray()) {
             return;
         }
-        try {
-            Class<?> poc = Class.forName("poc", false, cl);
-            inspectCandidateClass(poc);
-        } catch (Throwable ignored) {
-        }
-        try {
-            Class<?> szf = Class.forName("szf", false, cl);
-            Constructor<?> ctor = szf.getDeclaredConstructor(Context.class, Bundle.class);
-            hookMethod(ctor).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    String target = readTarget();
-                    if (target != null) {
-                        setField(chain.getThisObject(), "c", target);
-                    }
-                    return res;
-                }
-            });
-            logI("Hooked szf.<init>");
-        } catch (Throwable ignored) {
-        }
-        try {
-            Class<?> sxk = Class.forName("sxk", false, cl);
-            Method save = sxk.getDeclaredMethod("onSaveInstanceState", Bundle.class);
-            hookMethod(save).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    String target = readTarget();
-                    if (target != null && chain.getArg(0) instanceof Bundle) {
-                        ((Bundle) chain.getArg(0)).putString(
-                                "BillingAccountModel.billingAccountName", target);
-                    }
-                    return res;
-                }
-            });
-            logI("Hooked sxk.onSaveInstanceState");
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void inspectCandidateClass(Class<?> cls) {
         String name = cls.getName();
-        if (name.indexOf('.') >= 0 || name.length() > 5) {
+        if (name.startsWith("java.") || name.startsWith("android.")
+                || name.startsWith("dalvik.") || name.startsWith("io.github.")) {
             return;
         }
         if (!inspectedClasses.add(name)) {
@@ -393,50 +525,118 @@ public class XposedInit extends XposedModule {
             return;
         }
 
-        List<Method> toAccountMethods = new ArrayList<>();
-        List<Method> noArgToStringMethods = new ArrayList<>();
-        List<Method> noArgToListMethods = new ArrayList<>();
+        List<Method> toAccount = new ArrayList<>();
+        List<Method> toAccountArray = new ArrayList<>();
+        List<Method> noArgToList = new ArrayList<>();
+        List<Method> noArgToString = new ArrayList<>();
 
         for (Method m : methods) {
-            if (Modifier.isStatic(m.getModifiers()) || m.isBridge() || m.isSynthetic()) {
+            int mod = m.getModifiers();
+            if (Modifier.isStatic(mod) || Modifier.isAbstract(mod) || Modifier.isNative(mod)
+                    || m.isBridge() || m.isSynthetic()) {
                 continue;
             }
             Class<?> ret = m.getReturnType();
             Class<?>[] ps = m.getParameterTypes();
-
             if (Account.class.isAssignableFrom(ret)) {
-                toAccountMethods.add(m);
-            } else if (ps.length == 0 && ret == String.class) {
-                noArgToStringMethods.add(m);
+                toAccount.add(m);
+            } else if (ret == Account[].class && ps.length == 0) {
+                toAccountArray.add(m);
             } else if (ps.length == 0 && List.class.isAssignableFrom(ret)) {
-                noArgToListMethods.add(m);
+                noArgToList.add(m);
+            } else if (ps.length == 0 && ret == String.class && !"toString".equals(m.getName())) {
+                noArgToString.add(m);
             }
         }
 
-        boolean isTargetClass = "poc".equals(name) || !toAccountMethods.isEmpty();
-        if (!isTargetClass) {
+        boolean looksLikeRepo = !toAccount.isEmpty() || !toAccountArray.isEmpty();
+        if (!looksLikeRepo) {
             return;
         }
 
-        logI("Inspecting Finsky class: " + name
-                + " (->Account=" + toAccountMethods.size()
-                + ", ()->Str=" + noArgToStringMethods.size()
-                + ", ()->List=" + noArgToListMethods.size() + ")");
+        logI("Discovered concrete Account class: " + name
+                + " (->Acct=" + toAccount.size()
+                + ", ()->Acct[]=" + toAccountArray.size()
+                + ", ()->List=" + noArgToList.size()
+                + ", ()->Str=" + noArgToString.size() + ")");
         dumpClass(cls, name);
 
-        for (final Method m : noArgToListMethods) {
-            hookAccountListGetter(cls, m);
+        for (Method m : toAccount) {
+            hookAccountReturnMethod(cls, m);
         }
-        for (final Method m : toAccountMethods) {
-            hookAccountGetter(cls, m);
+        for (Method m : toAccountArray) {
+            hookAccountArrayReturnMethod(cls, m);
         }
-        for (final Method m : noArgToStringMethods) {
-            hookAccountStringGetter(cls, m);
+        for (Method m : noArgToList) {
+            hookAccountListReturnMethod(cls, m);
+        }
+        for (Method m : noArgToString) {
+            hookEmailStringReturnMethod(cls, m);
         }
     }
 
-    private static void hookAccountListGetter(final Class<?> cls, final Method m) {
-        String sig = cls.getName() + "#" + m.getName() + "():List";
+    private static void hookAccountReturnMethod(final Class<?> cls, final Method m) {
+        final String sig = cls.getName() + "#" + m.getName() + "(" + m.getParameterTypes().length + "):Account";
+        if (!hookedMethods.add(sig)) {
+            return;
+        }
+        try {
+            m.setAccessible(true);
+            hookMethod(m).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    String target = readTarget();
+                    if (target == null) {
+                        return chain.proceed();
+                    }
+                    Object orig = null;
+                    try {
+                        orig = chain.proceed();
+                    } catch (Throwable ignored) {
+                    }
+                    if (orig instanceof Account && !"com.google".equals(((Account) orig).type)) {
+                        return orig;
+                    }
+                    logOnce("hook_acct:" + sig + ":" + target,
+                            "Redirected " + sig + " -> " + target);
+                    return resolveTargetAccount(target);
+                }
+            });
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
+        }
+    }
+
+    private static void hookAccountArrayReturnMethod(final Class<?> cls, final Method m) {
+        final String sig = cls.getName() + "#" + m.getName() + "():Account[]";
+        if (!hookedMethods.add(sig)) {
+            return;
+        }
+        try {
+            m.setAccessible(true);
+            hookMethod(m).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    Object res = chain.proceed();
+                    if (!(res instanceof Account[])) {
+                        return res;
+                    }
+                    String target = readTarget();
+                    if (target == null) {
+                        return res;
+                    }
+                    return isolateTargetAccount((Account[]) res, target, false, sig);
+                }
+            });
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
+        }
+    }
+
+    private static void hookAccountListReturnMethod(final Class<?> cls, final Method m) {
+        final String sig = cls.getName() + "#" + m.getName() + "():List";
         if (!hookedMethods.add(sig)) {
             return;
         }
@@ -449,49 +649,34 @@ public class XposedInit extends XposedModule {
                     if (!(res instanceof List)) {
                         return res;
                     }
+                    String target = readTarget();
+                    if (target == null) {
+                        return res;
+                    }
                     List<?> raw = (List<?>) res;
-                    boolean hasGoogleAccount = false;
+                    Account matched = null;
+                    boolean hasGoogle = false;
                     for (Object o : raw) {
                         if (o instanceof Account && "com.google".equals(((Account) o).type)) {
-                            hasGoogleAccount = true;
-                            break;
+                            hasGoogle = true;
+                            if (target.equalsIgnoreCase(((Account) o).name)) {
+                                matched = (Account) o;
+                            }
                         }
                     }
-                    if (!hasGoogleAccount) {
+                    if (!hasGoogle || matched == null) {
                         return res;
                     }
-                    if (repoInstance == null && chain.getThisObject() != null) {
-                        repoInstance = chain.getThisObject();
-                    }
-                    if (repoAccountsListMethod == null) {
-                        repoAccountsListMethod = m;
-                    }
-                    if (!accountsSent && appContext != null) {
-                        accountsSent = true;
-                        sendAccounts(appContext);
-                    }
-                    String target = readTarget();
-                    if (target == null || raw.size() <= 1) {
-                        return res;
-                    }
-                    Account matched = null;
-                    List<Object> reordered = new ArrayList<>(raw.size());
+                    List<Object> out = new ArrayList<>();
+                    out.add(matched);
                     for (Object o : raw) {
-                        if (matched == null && o instanceof Account
-                                && "com.google".equals(((Account) o).type)
-                                && target.equalsIgnoreCase(((Account) o).name)) {
-                            matched = (Account) o;
-                        } else {
-                            reordered.add(o);
+                        if (!(o instanceof Account) || !"com.google".equals(((Account) o).type)) {
+                            out.add(o);
                         }
                     }
-                    if (matched != null) {
-                        reordered.add(0, matched);
-                        logOnce("list:" + sig + ":" + target,
-                                "Reordered " + sig + " -> " + target);
-                        return reordered;
-                    }
-                    return res;
+                    logOnce("hook_list:" + sig + ":" + target,
+                            "Isolated list " + sig + " -> [" + target + "]");
+                    return out;
                 }
             });
             logI("Hooked " + sig);
@@ -500,8 +685,8 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    private static void hookAccountGetter(final Class<?> cls, final Method m) {
-        String sig = cls.getName() + "#" + m.getName() + "(" + m.getParameterTypes().length + "):Account";
+    private static void hookEmailStringReturnMethod(final Class<?> cls, final Method m) {
+        final String sig = cls.getName() + "#" + m.getName() + "():String";
         if (!hookedMethods.add(sig)) {
             return;
         }
@@ -510,57 +695,15 @@ public class XposedInit extends XposedModule {
             hookMethod(m).intercept(new Hooker() {
                 @Override
                 public Object intercept(Chain chain) throws Throwable {
-                    if (repoInstance == null && chain.getThisObject() != null) {
-                        repoInstance = chain.getThisObject();
-                    }
-                    if (!accountsSent && appContext != null) {
-                        accountsSent = true;
-                        sendAccounts(appContext);
-                    }
-                    String target = readTarget();
-                    if (target == null) {
-                        return chain.proceed();
-                    }
-                    Object orig = null;
-                    try {
-                        orig = chain.proceed();
-                    } catch (Throwable ignored) {
-                    }
-                    if (orig instanceof Account) {
-                        Account origAcct = (Account) orig;
-                        if (!"com.google".equals(origAcct.type)) {
-                            return orig;
-                        }
-                    }
-                    logOnce("acct:" + sig + ":" + target,
-                            "Intercepted " + sig + " -> " + target);
-                    return resolveTargetAccount(chain.getThisObject(), target);
-                }
-            });
-            logI("Hooked " + sig);
-        } catch (Throwable t) {
-            logE("Failed hooking " + sig + ": " + t);
-        }
-    }
-
-    private static void hookAccountStringGetter(final Class<?> cls, final Method m) {
-        String sig = cls.getName() + "#" + m.getName() + "():String";
-        if (!hookedMethods.add(sig)) {
-            return;
-        }
-        try {
-            m.setAccessible(true);
-            hookMethod(m).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    String target = readTarget();
-                    if (target == null) {
-                        return chain.proceed();
-                    }
                     Object orig = chain.proceed();
-                    if (orig instanceof String && ((String) orig).indexOf('@') > 0) {
-                        logOnce("str:" + sig + ":" + target,
-                                "Intercepted " + sig + ": " + orig + " -> " + target);
+                    String target = readTarget();
+                    if (target == null || !(orig instanceof String)) {
+                        return orig;
+                    }
+                    String s = (String) orig;
+                    if (isOtherKnownGoogleEmail(s, target)) {
+                        logOnce("hook_str:" + sig + ":" + target,
+                                "Redirected " + sig + ": " + s + " -> " + target);
                         return target;
                     }
                     return orig;
@@ -614,35 +757,20 @@ public class XposedInit extends XposedModule {
 
     private static void sendAccounts(Context ctx) {
         List<String> names = new ArrayList<>();
-        Object repo = repoInstance;
-        if (repo != null && repoAccountsListMethod != null) {
-            try {
-                Object list = repoAccountsListMethod.invoke(repo);
-                if (list instanceof List) {
-                    for (Object o : (List<?>) list) {
-                        if (o instanceof Account) {
-                            Account a = (Account) o;
-                            if ("com.google".equals(a.type) && !names.contains(a.name)) {
-                                names.add(a.name);
-                            }
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        if (names.isEmpty() && ctx != null) {
+        if (ctx != null) {
+            bypassAccountFilter.set(Boolean.TRUE);
             try {
                 Account[] accts = AccountManager.get(ctx).getAccountsByType("com.google");
+                recordKnownEmails(accts);
                 for (Account a : accts) {
                     if (!names.contains(a.name)) {
                         names.add(a.name);
                     }
                 }
             } catch (Throwable ignored) {
+            } finally {
+                bypassAccountFilter.set(Boolean.FALSE);
             }
-        }
-        if (ctx != null) {
             Intent out = new Intent(ACTION_ACCOUNTS);
             out.setPackage(APP_PACKAGE);
             out.putExtra("accounts", names.toArray(new String[names.size()]));
@@ -655,22 +783,9 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    private static Account resolveTargetAccount(Object repo, String target) {
-        Object inst = repo != null ? repo : repoInstance;
-        if (inst != null && repoAccountsListMethod != null) {
-            try {
-                Object list = repoAccountsListMethod.invoke(inst);
-                if (list instanceof List) {
-                    for (Object o : (List<?>) list) {
-                        if (o instanceof Account && target.equalsIgnoreCase(((Account) o).name)) {
-                            return (Account) o;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
-        }
+    private static Account resolveTargetAccount(String target) {
         if (appContext != null) {
+            bypassAccountFilter.set(Boolean.TRUE);
             try {
                 Account[] accts = AccountManager.get(appContext).getAccountsByType("com.google");
                 for (Account a : accts) {
@@ -679,6 +794,8 @@ public class XposedInit extends XposedModule {
                     }
                 }
             } catch (Throwable ignored) {
+            } finally {
+                bypassAccountFilter.set(Boolean.FALSE);
             }
         }
         return new Account(target, "com.google");
@@ -689,7 +806,7 @@ public class XposedInit extends XposedModule {
             return overrideTarget;
         }
         String fromProvider = readProvider();
-        if (fromProvider != null) {
+        if (providerCached) {
             return fromProvider;
         }
         return readFile();
@@ -777,23 +894,6 @@ public class XposedInit extends XposedModule {
         logI(sb.toString());
     }
 
-    private static void setField(Object obj, String name, Object value) {
-        if (obj == null) {
-            return;
-        }
-        for (Class<?> c = obj.getClass(); c != null; c = c.getSuperclass()) {
-            try {
-                Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(obj, value);
-                return;
-            } catch (NoSuchFieldException ignored) {
-            } catch (Throwable ignored) {
-                return;
-            }
-        }
-    }
-
     private static XposedInterface.HookBuilder hookMethod(
             java.lang.reflect.Executable executable) {
         return self.hook(executable);
@@ -807,10 +907,6 @@ public class XposedInit extends XposedModule {
 
     private static void logI(String msg) {
         if (self != null) self.log(Log.INFO, TAG, msg); else Log.i(TAG, msg);
-    }
-
-    private static void logD(String msg) {
-        if (self != null) self.log(Log.DEBUG, TAG, msg); else Log.d(TAG, msg);
     }
 
     private static void logW(String msg) {
