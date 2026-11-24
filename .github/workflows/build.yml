@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      PREFIX: /usr
     steps:
       - uses: actions/checkout@v4
 
@@ -20,12 +22,17 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" > /dev/null
-          mkdir -p "$HOME/android-sdk/build-tools"
-          ln -sfn "$ANDROID_HOME/build-tools/34.0.0" "$HOME/android-sdk/build-tools/34.0.0"
-          [ -f "$ANDROID_HOME/build-tools/34.0.0/lib/d8.jar" ] && ln -sf "$ANDROID_HOME/build-tools/34.0.0/lib/d8.jar" "$ANDROID_HOME/build-tools/34.0.0/d8.jar"
-          echo "$HOME/android-sdk/build-tools/34.0.0" >> "$GITHUB_PATH"
-          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
+          ln -sfn "$ANDROID_HOME" "$HOME/android-sdk"
+          mkdir -p "$HOME/Android"
+          ln -sfn "$ANDROID_HOME" "$HOME/Android/Sdk"
+          sudo mkdir -p /usr/share/java
+          D8_JAR=$(find "$ANDROID_HOME" -name "d8.jar" | head -n 1)
+          APKSIGNER_JAR=$(find "$ANDROID_HOME" -name "apksigner.jar" | head -n 1)
+          echo "Found D8_JAR=$D8_JAR"
+          echo "Found APKSIGNER_JAR=$APKSIGNER_JAR"
+          [ -n "$D8_JAR" ] && sudo ln -sf "$D8_JAR" /usr/share/java/d8.jar
+          [ -n "$APKSIGNER_JAR" ] && sudo ln -sf "$APKSIGNER_JAR" /usr/share/java/apksigner.jar
 
       - name: Fetch compile-only android.jar
         run: |
@@ -35,7 +42,7 @@ jobs:
 
       - name: Build
         run: |
-          sed -i -E 's|build-tools/[0-9]+\.[0-9]+\.[0-9]+|build-tools/34.0.0|g' build.sh
+          cat -n build.sh
           bash build.sh
 
       - name: Upload APK
