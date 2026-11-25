@@ -429,12 +429,9 @@ public class XposedInit extends XposedModule {
 
     private static void showResetConfirmDialog(final Activity act) {
         try {
-            String target = readTarget();
-            String info = target != null ? target : "Mặc định hệ thống";
-            new AlertDialog.Builder(act)
+            AlertDialog dialog = new AlertDialog.Builder(act)
                     .setTitle("Đăng xuất & Xóa dữ liệu")
-                    .setMessage("Xóa toàn bộ dữ liệu Google Phần thưởng cho ý kiến và thoát app?\n\n"
-                            + "Tài khoản đang chọn ở PSwitch:\n" + info)
+                    .setMessage("Xóa toàn bộ dữ liệu Google Phần thưởng cho ý kiến và thoát app?")
                     .setPositiveButton("Xóa ngay", new DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(DialogInterface dialog, int which) {
@@ -442,7 +439,33 @@ public class XposedInit extends XposedModule {
                         }
                     })
                     .setNegativeButton("Hủy", null)
-                    .show();
+                    .create();
+
+            dialog.show();
+
+            // Tông popup đen/xám, chữ sáng và nút dễ nhìn.
+            if (dialog.getWindow() != null) {
+                GradientDrawable dialogBg = new GradientDrawable();
+                dialogBg.setColor(0xFF242424);
+                dialogBg.setCornerRadius(dp(act, 18));
+                dialog.getWindow().setBackgroundDrawable(dialogBg);
+            }
+
+            int titleId = act.getResources().getIdentifier("alertTitle", "id", "android");
+            TextView titleView = dialog.findViewById(titleId);
+            if (titleView != null) {
+                titleView.setTextColor(0xFFF2F2F2);
+            }
+
+            int messageId = act.getResources().getIdentifier("message", "id", "android");
+            TextView messageView = dialog.findViewById(messageId);
+            if (messageView != null) {
+                messageView.setTextColor(0xFFCCCCCC);
+                messageView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            }
+
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(0xFFB0B0B0);
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(0xFF80CBC4);
         } catch (Throwable t) {
             // Fallback nếu theme Activity không hỗ trợ AlertDialog chuẩn
             clearOwnAppData(act);
