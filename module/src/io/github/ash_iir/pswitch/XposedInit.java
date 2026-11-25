@@ -4,16 +4,17 @@ import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.app.Activity;
 import android.app.ActivityManager;
-import android.app.AlertDialog;
 import android.app.Application;
+import android.app.Dialog;
 import android.app.Instrumentation;
 import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
@@ -22,7 +23,9 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -120,9 +123,6 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    /**
-     * Layer 1: Giữ Context để đọc ContentProvider và đăng ký BroadcastReceiver.
-     */
     private void hookApplication() {
         try {
             Method onCreate = Application.class.getDeclaredMethod("onCreate");
@@ -145,9 +145,6 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    /**
-     * Layer 2: Cô lập tài khoản Google trên AccountManager cho tất cả app trong Scope.
-     */
     private void hookAccountManager() {
         try {
             Method getByType = AccountManager.class.getDeclaredMethod(
@@ -288,9 +285,6 @@ public class XposedInit extends XposedModule {
         return out.toArray(new Account[out.size()]);
     }
 
-    /**
-     * Layer 3: Chặn TRƯỚC khi onCreate() của Activity chạy để ghi đè Intent/Bundle.
-     */
     private void hookActivityLaunch() {
         try {
             Method callOnCreate = Instrumentation.class.getDeclaredMethod(
@@ -356,8 +350,7 @@ public class XposedInit extends XposedModule {
     }
 
     /**
-     * Layer 3.5: Chèn nút nổi "Reset Acc" trong Google Opinion Rewards (paidtasks)
-     * để xóa dữ liệu / đăng xuất nhanh bằng 1 chạm.
+     * Chèn nút nổi "Reset Acc" trong Google Phần thưởng cho ý kiến.
      */
     private void hookPaidTasksQuickReset() {
         try {
@@ -404,7 +397,7 @@ public class XposedInit extends XposedModule {
             btn.setPadding(padH, padV, padH, padV);
 
             GradientDrawable bg = new GradientDrawable();
-            bg.setColor(0xD9C62828); // Đỏ đậm hơi trong suốt
+            bg.setColor(0xD9C62828);
             bg.setCornerRadius(dp(act, 20));
             btn.setBackgroundDrawable(bg);
 
@@ -429,45 +422,98 @@ public class XposedInit extends XposedModule {
 
     private static void showResetConfirmDialog(final Activity act) {
         try {
-            AlertDialog dialog = new AlertDialog.Builder(act)
-                    .setTitle("Đăng xuất & Xóa dữ liệu")
-                    .setMessage("Xóa toàn bộ dữ liệu Google Phần thưởng cho ý kiến và thoát app?")
-                    .setPositiveButton("Xóa ngay", new DialogInterface.OnClickListener() {
-                        @Override
-                        public void onClick(DialogInterface dialog, int which) {
-                            clearOwnAppData(act);
-                        }
-                    })
-                    .setNegativeButton("Hủy", null)
-                    .create();
+            final Dialog dialog = new Dialog(act);
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+            LinearLayout card = new LinearLayout(act);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(act, 22), dp(act, 20), dp(act, 22), dp(act, 18));
+
+            GradientDrawable cardBg = new GradientDrawable();
+            cardBg.setColor(0xFF1F2024);
+            cardBg.setCornerRadius(dp(act, 22));
+            cardBg.setStroke(dp(act, 1), 0xFF33353B);
+            card.setBackgroundDrawable(cardBg);
+
+            TextView title = new TextView(act);
+            title.setText("Đăng xuất & Xóa dữ liệu");
+            title.setTextColor(0xFFF1F3F4);
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            title.setTypeface(null, Typeface.BOLD);
+            card.addView(title);
+
+            TextView msg = new TextView(act);
+            msg.setText("Xóa toàn bộ dữ liệu Google Phần thưởng cho ý kiến và thoát app?");
+            msg.setTextColor(0xFFBDC1C6);
+            msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            msg.setLineSpacing(dp(act, 3), 1.0f);
+            LinearLayout.LayoutParams msgLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            msgLp.setMargins(0, dp(act, 10), 0, dp(act, 22));
+            card.addView(msg, msgLp);
+
+            LinearLayout btnRow = new LinearLayout(act);
+            btnRow.setOrientation(LinearLayout.HORIZONTAL);
+            btnRow.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+
+            TextView cancelBtn = new TextView(act);
+            cancelBtn.setText("Hủy");
+            cancelBtn.setTextColor(0xFFDADCE0);
+            cancelBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            cancelBtn.setPadding(dp(act, 18), dp(act, 9), dp(act, 18), dp(act, 9));
+            GradientDrawable cancelBg = new GradientDrawable();
+            cancelBg.setColor(0xFF2E3036);
+            cancelBg.setCornerRadius(dp(act, 16));
+            cancelBtn.setBackgroundDrawable(cancelBg);
+            LinearLayout.LayoutParams cancelLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            cancelLp.setMargins(0, 0, dp(act, 10), 0);
+            cancelBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    dialog.dismiss();
+                }
+            });
+            btnRow.addView(cancelBtn, cancelLp);
+
+            TextView confirmBtn = new TextView(act);
+            confirmBtn.setText("Xóa ngay");
+            confirmBtn.setTextColor(Color.WHITE);
+            confirmBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            confirmBtn.setTypeface(null, Typeface.BOLD);
+            confirmBtn.setPadding(dp(act, 18), dp(act, 9), dp(act, 18), dp(act, 9));
+            GradientDrawable confirmBg = new GradientDrawable();
+            confirmBg.setColor(0xFFC62828);
+            confirmBg.setCornerRadius(dp(act, 16));
+            confirmBtn.setBackgroundDrawable(confirmBg);
+            confirmBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    dialog.dismiss();
+                    clearOwnAppData(act);
+                }
+            });
+            btnRow.addView(confirmBtn);
+
+            card.addView(btnRow, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            dialog.setContentView(card);
+            dialog.setCanceledOnTouchOutside(true);
+
+            Window win = dialog.getWindow();
+            if (win != null) {
+                win.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                int width = Math.round(act.getResources().getDisplayMetrics().widthPixels * 0.84f);
+                win.setLayout(width, ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
 
             dialog.show();
-
-            // Tông popup đen/xám, chữ sáng và nút dễ nhìn.
-            if (dialog.getWindow() != null) {
-                GradientDrawable dialogBg = new GradientDrawable();
-                dialogBg.setColor(0xFF242424);
-                dialogBg.setCornerRadius(dp(act, 18));
-                dialog.getWindow().setBackgroundDrawable(dialogBg);
-            }
-
-            int titleId = act.getResources().getIdentifier("alertTitle", "id", "android");
-            TextView titleView = dialog.findViewById(titleId);
-            if (titleView != null) {
-                titleView.setTextColor(0xFFF2F2F2);
-            }
-
-            int messageId = act.getResources().getIdentifier("message", "id", "android");
-            TextView messageView = dialog.findViewById(messageId);
-            if (messageView != null) {
-                messageView.setTextColor(0xFFCCCCCC);
-                messageView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-            }
-
-            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(0xFFB0B0B0);
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(0xFF80CBC4);
         } catch (Throwable t) {
-            // Fallback nếu theme Activity không hỗ trợ AlertDialog chuẩn
+            logW("showResetConfirmDialog failed: " + t);
             clearOwnAppData(act);
         }
     }
@@ -485,7 +531,6 @@ public class XposedInit extends XposedModule {
             logW("clearApplicationUserData reflection failed: " + t);
         }
 
-        // Dự phòng: tự xóa thư mục data của app và thoát tiến trình
         try {
             File dataDir = ctx.getFilesDir().getParentFile();
             if (dataDir != null && dataDir.exists()) {
@@ -647,10 +692,6 @@ public class XposedInit extends XposedModule {
         return knownGoogleEmails.contains(val.toLowerCase());
     }
 
-    /**
-     * Layer 4: Tự động dò class AccountRepository thật của Finsky từ stack trace khi
-     * Play Store gọi AccountManager.
-     */
     private static void discoverFromStackTrace(StackTraceElement[] frames) {
         ClassLoader cl = appContext != null ? appContext.getClassLoader() : packageLoader;
         if (cl == null || frames == null) {
