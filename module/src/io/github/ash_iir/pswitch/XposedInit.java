@@ -3,16 +3,28 @@ package io.github.ash_iir.pswitch;
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AlertDialog;
 import android.app.Application;
 import android.app.Instrumentation;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -36,7 +48,9 @@ public class XposedInit extends XposedModule {
     private static final String VENDING = "com.android.vending";
     private static final String GOOGLE_ONE = "com.google.android.apps.subscriptions.red";
     private static final String MAIHOKU = "io.github.xiaotong6666.maihoku";
+    private static final String PAID_TASKS = "com.google.android.apps.paidtasks";
     private static final String APP_PACKAGE = "io.github.ash_iir.pswitch";
+    private static final String RESET_BTN_TAG = "pswitch_quick_reset_btn";
 
     private static final String TARGET_FILE =
             "/data/data/" + VENDING + "/files/pswitch_target.txt";
@@ -61,6 +75,7 @@ public class XposedInit extends XposedModule {
     private static ClassLoader packageLoader;
     private static String currentPackage;
     private static boolean isVendingProcess;
+    private static boolean isPaidTasksProcess;
 
     private static volatile String overrideTarget;
     private static volatile boolean hasOverride;
@@ -93,12 +108,16 @@ public class XposedInit extends XposedModule {
         }
         currentPackage = pkg;
         isVendingProcess = VENDING.equals(pkg);
+        isPaidTasksProcess = PAID_TASKS.equals(pkg);
         packageLoader = param.getClassLoader();
         logI("onPackageReady: " + pkg);
 
         hookApplication();
         hookAccountManager();
         hookActivityLaunch();
+        if (isPaidTasksProcess) {
+            hookPaidTasksQuickReset();
+        }
     }
 
     /**
@@ -127,8 +146,7 @@ public class XposedInit extends XposedModule {
     }
 
     /**
-     * Layer 2: Cô lập tài khoản Google trên AccountManager cho tất cả app trong Scope
-     * (Play Store, Google One, MaiHoku...), chỉ trả về duy nhất tài khoản đã chọn.
+     * Layer 2: Cô lập tài khoản Google trên AccountManager cho tất cả app trong Scope.
      */
     private void hookAccountManager() {
         try {
@@ -271,8 +289,7 @@ public class XposedInit extends XposedModule {
     }
 
     /**
-     * Layer 3: Chặn TRƯỚC khi onCreate() của Activity chạy để ghi đè Intent/Bundle thực sự
-     * (áp dụng cho cả Play Store, Google One và MaiHoku).
+     * Layer 3: Chặn TRƯỚC khi onCreate() của Activity chạy để ghi đè Intent/Bundle.
      */
     private void hookActivityLaunch() {
         try {
@@ -336,6 +353,152 @@ public class XposedInit extends XposedModule {
                     });
         } catch (Throwable ignored) {
         }
+    }
+
+    /**
+     * Layer 3.5: Chèn nút nổi "Reset Acc" trong Google Opinion Rewards (paidtasks)
+     * để xóa dữ liệu / đăng xuất nhanh bằng 1 chạm.
+     */
+    private void hookPaidTasksQuickReset() {
+        try {
+            Method onResume = Instrumentation.class.getDeclaredMethod(
+                    "callActivityOnResume", Activity.class);
+            hookMethod(onResume).intercept(new Hooker() {
+                @Override
+                public Object intercept(Chain chain) throws Throwable {
+                    Object res = chain.proceed();
+                    Object arg0 = chain.getArg(0);
+                    if (arg0 instanceof Activity) {
+                        injectResetButton((Activity) arg0);
+                    }
+                    return res;
+                }
+            });
+            logI("Hooked Instrumentation.callActivityOnResume for PaidTasks quick reset");
+        } catch (Throwable t) {
+            logE("hookPaidTasksQuickReset failed: " + t);
+        }
+    }
+
+    private static void injectResetButton(final Activity act) {
+        try {
+            if (act == null || act.isFinishing() || act.getWindow() == null) {
+                return;
+            }
+            View decor = act.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup)) {
+                return;
+            }
+            ViewGroup root = (ViewGroup) decor;
+            if (root.findViewWithTag(RESET_BTN_TAG) != null) {
+                return;
+            }
+
+            TextView btn = new TextView(act);
+            btn.setTag(RESET_BTN_TAG);
+            btn.setText("Reset Acc");
+            btn.setTextColor(Color.WHITE);
+            btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            int padH = dp(act, 14);
+            int padV = dp(act, 8);
+            btn.setPadding(padH, padV, padH, padV);
+
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(0xD9C62828); // Đỏ đậm hơi trong suốt
+            bg.setCornerRadius(dp(act, 20));
+            btn.setBackgroundDrawable(bg);
+
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.BOTTOM | Gravity.RIGHT;
+            lp.setMargins(0, 0, dp(act, 16), dp(act, 88));
+
+            btn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showResetConfirmDialog(act);
+                }
+            });
+
+            root.addView(btn, lp);
+        } catch (Throwable t) {
+            logW("injectResetButton failed: " + t);
+        }
+    }
+
+    private static void showResetConfirmDialog(final Activity act) {
+        try {
+            String target = readTarget();
+            String info = target != null ? target : "Mặc định hệ thống";
+            new AlertDialog.Builder(act)
+                    .setTitle("Đăng xuất & Xóa dữ liệu")
+                    .setMessage("Xóa toàn bộ dữ liệu Google Phần thưởng cho ý kiến và thoát app?\n\n"
+                            + "Tài khoản đang chọn ở PSwitch:\n" + info)
+                    .setPositiveButton("Xóa ngay", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            clearOwnAppData(act);
+                        }
+                    })
+                    .setNegativeButton("Hủy", null)
+                    .show();
+        } catch (Throwable t) {
+            // Fallback nếu theme Activity không hỗ trợ AlertDialog chuẩn
+            clearOwnAppData(act);
+        }
+    }
+
+    private static void clearOwnAppData(Context ctx) {
+        try {
+            ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                Method clearMethod = ActivityManager.class.getMethod("clearApplicationUserData");
+                Object ok = clearMethod.invoke(am);
+                logI("clearApplicationUserData() -> " + ok);
+                return;
+            }
+        } catch (Throwable t) {
+            logW("clearApplicationUserData reflection failed: " + t);
+        }
+
+        // Dự phòng: tự xóa thư mục data của app và thoát tiến trình
+        try {
+            File dataDir = ctx.getFilesDir().getParentFile();
+            if (dataDir != null && dataDir.exists()) {
+                File[] children = dataDir.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        if (!"lib".equals(child.getName())) {
+                            deleteRecursive(child);
+                        }
+                    }
+                }
+            }
+            Toast.makeText(ctx, "Đã xóa dữ liệu, hãy mở lại app", Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {
+        }
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    private static void deleteRecursive(File f) {
+        if (f == null || !f.exists()) {
+            return;
+        }
+        if (f.isDirectory()) {
+            File[] children = f.listFiles();
+            if (children != null) {
+                for (File c : children) {
+                    deleteRecursive(c);
+                }
+            }
+        }
+        f.delete();
+    }
+
+    private static int dp(Context ctx, int value) {
+        float density = ctx.getResources().getDisplayMetrics().density;
+        return Math.round(value * density);
     }
 
     private static void handleActivityBeforeCreate(Activity act, Bundle savedState) {
