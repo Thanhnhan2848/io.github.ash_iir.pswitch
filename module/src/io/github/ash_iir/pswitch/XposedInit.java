@@ -9,7 +9,6 @@ import android.app.Dialog;
 import android.app.Instrumentation;
 import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
@@ -18,9 +17,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
-import android.os.Binder;
 import android.os.Bundle;
-import android.os.IBinder;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -33,6 +30,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -50,38 +49,20 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 public class XposedInit extends XposedModule {
 
     private static final String TAG = "PSwitch";
-    private static final String APP_PACKAGE = "io.github.ash_iir.pswitch";
     private static final String VENDING = "com.android.vending";
     private static final String GOOGLE_ONE = "com.google.android.apps.subscriptions.red";
     private static final String MAIHOKU = "io.github.xiaotong6666.maihoku";
     private static final String PAID_TASKS = "com.google.android.apps.paidtasks";
-
-    private static final String[] TARGET_PACKAGES = new String[]{
-            VENDING,
-            GOOGLE_ONE,
-            MAIHOKU,
-            PAID_TASKS
-    };
-
+    private static final String APP_PACKAGE = "io.github.ash_iir.pswitch";
     private static final String RESET_BTN_TAG = "pswitch_quick_reset_btn";
+    private static final String TARGET_FILENAME = "pswitch_target.txt";
+
     private static final Uri PROVIDER_URI =
             Uri.parse("content://io.github.ash_iir.pswitch.provider/target");
 
     private static final String ACTION_SET = "io.github.ash_iir.pswitch.SET_ACCOUNT";
     private static final String ACTION_REQUEST = "io.github.ash_iir.pswitch.REQUEST_ACCOUNTS";
     private static final String ACTION_ACCOUNTS = "io.github.ash_iir.pswitch.ACCOUNTS";
-
-    // Đồng bộ phiên sống (chỉ hoạt động khi cả PSwitch và Play Store cùng mở)
-    private static final String ACTION_PING_PSWITCH = "io.github.ash_iir.pswitch.PING_PSWITCH_LIVE";
-    private static final String ACTION_PSWITCH_SYNC = "io.github.ash_iir.pswitch.PSWITCH_LIVE_SYNC";
-    private static final String ACTION_PSWITCH_STOP = "io.github.ash_iir.pswitch.PSWITCH_LIVE_STOP";
-
-    private static final String ACTION_PING_VENDING = "io.github.ash_iir.pswitch.PING_VENDING_LIVE";
-    private static final String ACTION_VENDING_SYNC = "io.github.ash_iir.pswitch.VENDING_LIVE_SYNC";
-    private static final String ACTION_VENDING_STOP = "io.github.ash_iir.pswitch.VENDING_LIVE_STOP";
-
-    private static final String EXTRA_TOKEN_BUNDLE = "pswitch_token_bundle";
-    private static final String EXTRA_BINDER_KEY = "token";
 
     private static final String[] BILLING_KEYS = new String[]{
             "BillingAccountModel.billingAccountName",
@@ -96,23 +77,14 @@ public class XposedInit extends XposedModule {
     private static Context appContext;
     private static ClassLoader packageLoader;
     private static String currentPackage;
-    private static boolean isPswitchApp;
     private static boolean isVendingProcess;
     private static boolean isPaidTasksProcess;
 
-    // Trạng thái bên trong app PSwitch
-    private static volatile Binder localPswitchToken;
-    private static volatile String localPswitchEmail;
-    private static int pswitchOpenActivities;
-
-    // Trạng thái bên trong Play Store
-    private static volatile Binder localVendingToken;
-    private static int vendingOpenActivities;
-
-    // Trạng thái nhận được ở các app mục tiêu
-    private static volatile IBinder remotePswitchToken;
-    private static volatile IBinder remoteVendingToken;
-    private static volatile String activeTargetEmail;
+    private static volatile String overrideTarget;
+    private static volatile boolean hasOverride;
+    private static volatile String cachedProvider;
+    private static volatile long cachedVersion = -1;
+    private static volatile boolean providerCached;
 
     private static final ThreadLocal<Boolean> bypassAccountFilter = new ThreadLocal<>();
 
@@ -134,17 +106,14 @@ public class XposedInit extends XposedModule {
     @Override
     public void onPackageReady(PackageReadyParam param) {
         String pkg = param.getPackageName();
+        if (APP_PACKAGE.equals(pkg)) {
+            return;
+        }
         currentPackage = pkg;
-        isPswitchApp = APP_PACKAGE.equals(pkg);
         isVendingProcess = VENDING.equals(pkg);
         isPaidTasksProcess = PAID_TASKS.equals(pkg);
         packageLoader = param.getClassLoader();
         logI("onPackageReady: " + pkg);
-
-        if (isPswitchApp) {
-            hookPswitchCompanionApp();
-            return;
-        }
 
         hookApplication();
         hookAccountManager();
@@ -153,222 +122,6 @@ public class XposedInit extends XposedModule {
             hookPaidTasksQuickReset();
         }
     }
-
-    // =========================================================================
-    // PHẦN 1: HOOK TRONG CHÍNH APP PSWITCH ĐỂ PHÁT TOKEN SỐNG KHI MỞ TAB
-    // =========================================================================
-
-    private void hookPswitchCompanionApp() {
-        try {
-            Method onCreate = Application.class.getDeclaredMethod("onCreate");
-            hookMethod(onCreate).setPriority(XposedInterface.PRIORITY_HIGHEST)
-                    .intercept(new Hooker() {
-                        @Override
-                        public Object intercept(Chain chain) throws Throwable {
-                            Object res = chain.proceed();
-                            Object app = chain.getThisObject();
-                            if (app instanceof Context) {
-                                appContext = (Context) app;
-                                registerPswitchHostReceiver(appContext);
-                            }
-                            return res;
-                        }
-                    });
-        } catch (Throwable t) {
-            logE("hookPswitchCompanionApp Application failed: " + t);
-        }
-
-        // Bắt thời điểm người dùng chọn tài khoản trong PSwitch
-        try {
-            Method sendBc = ContextWrapper.class.getDeclaredMethod("sendBroadcast", Intent.class);
-            hookMethod(sendBc).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object arg0 = chain.getArg(0);
-                    if (arg0 instanceof Intent) {
-                        Intent in = (Intent) arg0;
-                        if (ACTION_SET.equals(in.getAction())) {
-                            String email = in.getStringExtra("email");
-                            if (email != null && email.trim().isEmpty()) {
-                                email = null;
-                            }
-                            localPswitchEmail = email;
-                            if (localPswitchToken != null && appContext != null) {
-                                broadcastPswitchLive(appContext);
-                            }
-                        }
-                    }
-                    return chain.proceed();
-                }
-            });
-        } catch (Throwable t) {
-            logW("hook sendBroadcast in PSwitch failed: " + t);
-        }
-
-        // Theo dõi lúc tab PSwitch đang mở
-        try {
-            Method onResume = Instrumentation.class.getDeclaredMethod(
-                    "callActivityOnResume", Activity.class);
-            hookMethod(onResume).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    Object arg0 = chain.getArg(0);
-                    if (arg0 instanceof Activity) {
-                        Context ctx = appContext != null ? appContext : (Activity) arg0;
-                        if (localPswitchToken == null) {
-                            localPswitchToken = new Binder();
-                            pswitchOpenActivities = Math.max(pswitchOpenActivities, 1);
-                            logI("PSwitch tab opened -> live token created");
-                        }
-                        if (localPswitchEmail == null) {
-                            localPswitchEmail = queryPswitchProviderOnce(ctx);
-                        }
-                        broadcastPswitchLive(ctx);
-                    }
-                    return res;
-                }
-            });
-        } catch (Throwable t) {
-            logE("hook PSwitch onResume failed: " + t);
-        }
-
-        try {
-            Method onCreateAct = Instrumentation.class.getDeclaredMethod(
-                    "callActivityOnCreate", Activity.class, Bundle.class);
-            hookMethod(onCreateAct).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    Object arg0 = chain.getArg(0);
-                    if (arg0 instanceof Activity) {
-                        pswitchOpenActivities++;
-                        if (localPswitchToken == null) {
-                            localPswitchToken = new Binder();
-                        }
-                    }
-                    return res;
-                }
-            });
-        } catch (Throwable ignored) {
-        }
-
-        // Khi người dùng bấm Back đóng hẳn PSwitch (hoặc tắt Activity)
-        try {
-            Method onDestroy = Instrumentation.class.getDeclaredMethod(
-                    "callActivityOnDestroy", Activity.class);
-            hookMethod(onDestroy).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    Object arg0 = chain.getArg(0);
-                    if (arg0 instanceof Activity) {
-                        Activity act = (Activity) arg0;
-                        if (!act.isChangingConfigurations()) {
-                            pswitchOpenActivities = Math.max(0, pswitchOpenActivities - 1);
-                            if (pswitchOpenActivities == 0) {
-                                localPswitchToken = null;
-                                logI("PSwitch tab closed -> live token cleared");
-                                broadcastPswitchStop(appContext != null ? appContext : act);
-                            }
-                        }
-                    }
-                    return res;
-                }
-            });
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void registerPswitchHostReceiver(Context ctx) {
-        try {
-            BroadcastReceiver r = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context c, Intent intent) {
-                    if (intent == null) {
-                        return;
-                    }
-                    if (ACTION_PING_PSWITCH.equals(intent.getAction())) {
-                        if (localPswitchToken != null) {
-                            if (localPswitchEmail == null) {
-                                localPswitchEmail = queryPswitchProviderOnce(c);
-                            }
-                            broadcastPswitchLive(c);
-                        }
-                    }
-                }
-            };
-            IntentFilter f = new IntentFilter(ACTION_PING_PSWITCH);
-            registerReceiverCompat(ctx, r, f);
-            logI("PSwitch host live receiver registered");
-        } catch (Throwable t) {
-            logE("registerPswitchHostReceiver failed: " + t);
-        }
-    }
-
-    private static void broadcastPswitchLive(Context ctx) {
-        if (ctx == null || localPswitchToken == null) {
-            return;
-        }
-        Bundle tb = new Bundle();
-        putBinderCompat(tb, EXTRA_BINDER_KEY, localPswitchToken);
-        for (String targetPkg : TARGET_PACKAGES) {
-            try {
-                Intent out = new Intent(ACTION_PSWITCH_SYNC);
-                out.setPackage(targetPkg);
-                out.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-                out.putExtra("email", localPswitchEmail);
-                out.putExtra(EXTRA_TOKEN_BUNDLE, tb);
-                ctx.sendBroadcast(out);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private static void broadcastPswitchStop(Context ctx) {
-        if (ctx == null) {
-            return;
-        }
-        for (String targetPkg : TARGET_PACKAGES) {
-            try {
-                Intent out = new Intent(ACTION_PSWITCH_STOP);
-                out.setPackage(targetPkg);
-                out.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-                ctx.sendBroadcast(out);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private static String queryPswitchProviderOnce(Context ctx) {
-        if (ctx == null) {
-            return null;
-        }
-        Cursor c = null;
-        try {
-            c = ctx.getContentResolver().query(PROVIDER_URI, null, null, null, null);
-            if (c != null && c.moveToFirst()) {
-                int i = c.getColumnIndex("email");
-                if (i >= 0 && !c.isNull(i)) {
-                    String email = c.getString(i);
-                    return (email != null && !email.trim().isEmpty()) ? email.trim() : null;
-                }
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (c != null) {
-                try {
-                    c.close();
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-        return null;
-    }
-
-    // =========================================================================
-    // PHẦN 2: HOOK TRONG PLAY STORE, GOOGLE ONE, MAIHOKU, PAIDTASKS
-    // =========================================================================
 
     private void hookApplication() {
         try {
@@ -381,8 +134,9 @@ public class XposedInit extends XposedModule {
                             Object app = chain.getThisObject();
                             if (app instanceof Context) {
                                 appContext = (Context) app;
-                                registerTargetReceivers(appContext);
-                                pingLiveSessions(appContext);
+                                registerReceivers(appContext);
+                                // Đồng bộ ngay với provider nếu đang sống, ngược lại giữ file đã lưu
+                                readProvider();
                             }
                             return res;
                         }
@@ -391,97 +145,6 @@ public class XposedInit extends XposedModule {
         } catch (Throwable t) {
             logE("hookApplication failed: " + t);
         }
-    }
-
-    private static void pingLiveSessions(Context ctx) {
-        if (ctx == null) {
-            return;
-        }
-        try {
-            Intent pingPswitch = new Intent(ACTION_PING_PSWITCH);
-            pingPswitch.setPackage(APP_PACKAGE);
-            pingPswitch.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-            ctx.sendBroadcast(pingPswitch);
-        } catch (Throwable ignored) {
-        }
-        try {
-            Intent pingVending = new Intent(ACTION_PING_VENDING);
-            pingVending.setPackage(VENDING);
-            pingVending.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-            ctx.sendBroadcast(pingVending);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void broadcastVendingLive(Context ctx) {
-        if (ctx == null || localVendingToken == null) {
-            return;
-        }
-        Bundle tb = new Bundle();
-        putBinderCompat(tb, EXTRA_BINDER_KEY, localVendingToken);
-        for (String targetPkg : TARGET_PACKAGES) {
-            try {
-                Intent out = new Intent(ACTION_VENDING_SYNC);
-                out.setPackage(targetPkg);
-                out.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-                out.putExtra(EXTRA_TOKEN_BUNDLE, tb);
-                ctx.sendBroadcast(out);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private static void broadcastVendingStop(Context ctx) {
-        if (ctx == null) {
-            return;
-        }
-        for (String targetPkg : TARGET_PACKAGES) {
-            try {
-                Intent out = new Intent(ACTION_VENDING_STOP);
-                out.setPackage(targetPkg);
-                out.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
-                ctx.sendBroadcast(out);
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private static boolean isBinderLive(IBinder b) {
-        if (b == null) {
-            return false;
-        }
-        try {
-            return b.isBinderAlive() && b.pingBinder();
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    /**
-     * Chỉ trả về email mục tiêu khi CẢ HAI tab PSwitch và Play Store đang mở cùng lúc.
-     * Vuốt xóa tab PSwitch (hoặc xóa cả 2) -> IBinder chết -> lập tức trả về null (hết tác dụng).
-     */
-    static String readTarget() {
-        if (!isBinderLive(remotePswitchToken)) {
-            if (remotePswitchToken != null) {
-                remotePswitchToken = null;
-                activeTargetEmail = null;
-                logI("[" + currentPackage + "] PSwitch tab closed/killed -> disabled");
-            }
-            return null;
-        }
-
-        IBinder vToken = localVendingToken != null ? localVendingToken : remoteVendingToken;
-        if (!isBinderLive(vToken)) {
-            if (remoteVendingToken != null && !isBinderLive(remoteVendingToken)) {
-                remoteVendingToken = null;
-                logI("[" + currentPackage + "] Play Store tab closed/killed -> disabled");
-            }
-            return null;
-        }
-
-        String email = activeTargetEmail;
-        return (email != null && email.indexOf('@') > 0) ? email : null;
     }
 
     private void hookAccountManager() {
@@ -624,14 +287,6 @@ public class XposedInit extends XposedModule {
         return out.toArray(new Account[out.size()]);
     }
 
-    private static boolean isMainVendingActivity(Activity act) {
-        if (act == null || !isVendingProcess) {
-            return false;
-        }
-        String cn = act.getClass().getName().toLowerCase();
-        return !cn.contains("billing") && !cn.contains("acquire") && !cn.contains("purchase");
-    }
-
     private void hookActivityLaunch() {
         try {
             Method callOnCreate = Instrumentation.class.getDeclaredMethod(
@@ -643,18 +298,7 @@ public class XposedInit extends XposedModule {
                             Object arg0 = chain.getArg(0);
                             Object arg1 = chain.getArg(1);
                             if (arg0 instanceof Activity) {
-                                Activity act = (Activity) arg0;
-                                if (isMainVendingActivity(act)) {
-                                    vendingOpenActivities++;
-                                    if (localVendingToken == null) {
-                                        localVendingToken = new Binder();
-                                        logI("Play Store tab opened -> vending live token created");
-                                    }
-                                    Context ctx = appContext != null ? appContext : act;
-                                    broadcastVendingLive(ctx);
-                                    pingLiveSessions(ctx);
-                                }
-                                handleActivityBeforeCreate(act,
+                                handleActivityBeforeCreate((Activity) arg0,
                                         arg1 instanceof Bundle ? (Bundle) arg1 : null);
                             }
                             return chain.proceed();
@@ -676,50 +320,13 @@ public class XposedInit extends XposedModule {
                             Object arg0 = chain.getArg(0);
                             Object arg1 = chain.getArg(1);
                             if (arg0 instanceof Activity) {
-                                Activity act = (Activity) arg0;
-                                if (isMainVendingActivity(act)) {
-                                    vendingOpenActivities++;
-                                    if (localVendingToken == null) {
-                                        localVendingToken = new Binder();
-                                    }
-                                    Context ctx = appContext != null ? appContext : act;
-                                    broadcastVendingLive(ctx);
-                                    pingLiveSessions(ctx);
-                                }
-                                handleActivityBeforeCreate(act,
+                                handleActivityBeforeCreate((Activity) arg0,
                                         arg1 instanceof Bundle ? (Bundle) arg1 : null);
                             }
                             return chain.proceed();
                         }
                     });
         } catch (Throwable ignored) {
-        }
-
-        if (isVendingProcess) {
-            try {
-                Method onDestroy = Instrumentation.class.getDeclaredMethod(
-                        "callActivityOnDestroy", Activity.class);
-                hookMethod(onDestroy).intercept(new Hooker() {
-                    @Override
-                    public Object intercept(Chain chain) throws Throwable {
-                        Object res = chain.proceed();
-                        Object arg0 = chain.getArg(0);
-                        if (arg0 instanceof Activity) {
-                            Activity act = (Activity) arg0;
-                            if (isMainVendingActivity(act) && !act.isChangingConfigurations()) {
-                                vendingOpenActivities = Math.max(0, vendingOpenActivities - 1);
-                                if (vendingOpenActivities == 0) {
-                                    localVendingToken = null;
-                                    logI("Play Store tab closed -> vending live token cleared");
-                                    broadcastVendingStop(appContext != null ? appContext : act);
-                                }
-                            }
-                        }
-                        return res;
-                    }
-                });
-            } catch (Throwable ignored) {
-            }
         }
 
         try {
@@ -744,10 +351,9 @@ public class XposedInit extends XposedModule {
         }
     }
 
-    // =========================================================================
-    // PHẦN 3: NÚT NỔI "Reset Acc" + POPUP ĐEN XÁM BO TRÒN TRONG PAIDTASKS
-    // =========================================================================
-
+    /**
+     * Chèn nút nổi "Reset Acc" trong Google Phần thưởng cho ý kiến.
+     */
     private void hookPaidTasksQuickReset() {
         try {
             Method onResume = Instrumentation.class.getDeclaredMethod(
@@ -965,10 +571,6 @@ public class XposedInit extends XposedModule {
         return Math.round(value * density);
     }
 
-    // =========================================================================
-    // PHẦN 4: VÁ INTENT/BUNDLE & TỰ DÒ CLASS REPO TRONG FINSKY
-    // =========================================================================
-
     private static void handleActivityBeforeCreate(Activity act, Bundle savedState) {
         String target = readTarget();
         if (target == null || act == null) {
@@ -977,10 +579,38 @@ public class XposedInit extends XposedModule {
         String clsName = act.getClass().getName();
         Intent intent = act.getIntent();
         if (intent != null) {
+            if (isVendingProcess && (clsName.contains("billing")
+                    || clsName.contains("acquire")
+                    || clsName.contains("purchase"))) {
+                dumpIntentExtrasOnce(clsName, intent);
+            }
             patchIntent(intent, target, clsName + "#intent");
         }
         if (savedState != null) {
             patchBundle(savedState, target, clsName + "#savedState");
+        }
+    }
+
+    private static void dumpIntentExtrasOnce(String clsName, Intent intent) {
+        if (!loggedOnce.add("dumpIntent:" + clsName)) {
+            return;
+        }
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder("Intent extras for " + clsName + ":");
+            for (String k : extras.keySet()) {
+                Object v = extras.get(k);
+                String t = v == null ? "null" : v.getClass().getSimpleName();
+                sb.append("\n  ").append(k).append(" (").append(t).append(")");
+                if (v instanceof String || v instanceof Account) {
+                    sb.append(" = ").append(v);
+                }
+            }
+            logI(sb.toString());
+        } catch (Throwable ignored) {
         }
     }
 
@@ -1069,6 +699,7 @@ public class XposedInit extends XposedModule {
         if (cl == null || frames == null) {
             return;
         }
+        StringBuilder chainLog = new StringBuilder();
         for (StackTraceElement f : frames) {
             String cn = f.getClassName();
             if (cn == null
@@ -1081,11 +712,18 @@ public class XposedInit extends XposedModule {
                     || cn.startsWith("LSPHooker")) {
                 continue;
             }
+            if (chainLog.length() > 0) {
+                chainLog.append(" <- ");
+            }
+            chainLog.append(cn).append('#').append(f.getMethodName());
             try {
                 Class<?> cls = Class.forName(cn, false, cl);
                 inspectHierarchy(cls, 1);
             } catch (Throwable ignored) {
             }
+        }
+        if (chainLog.length() > 0) {
+            logOnce("am_stack:" + chainLog, "AccountManager stack: " + chainLog);
         }
     }
 
@@ -1157,6 +795,13 @@ public class XposedInit extends XposedModule {
             return;
         }
 
+        logI("Discovered concrete Account class: " + name
+                + " (->Acct=" + toAccount.size()
+                + ", ()->Acct[]=" + toAccountArray.size()
+                + ", ()->List=" + noArgToList.size()
+                + ", ()->Str=" + noArgToString.size() + ")");
+        dumpClass(cls, name);
+
         for (Method m : toAccount) {
             hookAccountReturnMethod(cls, m);
         }
@@ -1198,7 +843,9 @@ public class XposedInit extends XposedModule {
                     return resolveTargetAccount(target);
                 }
             });
-        } catch (Throwable ignored) {
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
         }
     }
 
@@ -1223,7 +870,9 @@ public class XposedInit extends XposedModule {
                     return isolateTargetAccount((Account[]) res, target, false, sig);
                 }
             });
-        } catch (Throwable ignored) {
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
         }
     }
 
@@ -1266,10 +915,14 @@ public class XposedInit extends XposedModule {
                             out.add(o);
                         }
                     }
+                    logOnce("hook_list:" + sig + ":" + target,
+                            "Isolated list " + sig + " -> [" + target + "]");
                     return out;
                 }
             });
-        } catch (Throwable ignored) {
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
         }
     }
 
@@ -1290,20 +943,20 @@ public class XposedInit extends XposedModule {
                     }
                     String s = (String) orig;
                     if (isOtherKnownGoogleEmail(s, target)) {
+                        logOnce("hook_str:" + sig + ":" + target,
+                                "Redirected " + sig + ": " + s + " -> " + target);
                         return target;
                     }
                     return orig;
                 }
             });
-        } catch (Throwable ignored) {
+            logI("Hooked " + sig);
+        } catch (Throwable t) {
+            logW("Failed hooking " + sig + ": " + t);
         }
     }
 
-    // =========================================================================
-    // PHẦN 5: NHẬN BROADCAST ĐỒNG BỘ & HỖ TRỢ IPC
-    // =========================================================================
-
-    private static void registerTargetReceivers(Context ctx) {
+    private static void registerReceivers(Context ctx) {
         try {
             BroadcastReceiver receiver = new BroadcastReceiver() {
                 @Override
@@ -1312,61 +965,37 @@ public class XposedInit extends XposedModule {
                         return;
                     }
                     String action = intent.getAction();
-                    if (ACTION_PSWITCH_SYNC.equals(action)) {
-                        Bundle tb = intent.getBundleExtra(EXTRA_TOKEN_BUNDLE);
-                        IBinder tok = getBinderCompat(tb, EXTRA_BINDER_KEY);
-                        if (tok != null) {
-                            remotePswitchToken = tok;
-                        }
+                    if (ACTION_SET.equals(action)) {
                         String email = intent.getStringExtra("email");
                         if (email != null && email.trim().isEmpty()) {
                             email = null;
                         }
-                        activeTargetEmail = email;
-                        logI("[" + currentPackage + "] PSwitch live sync -> " + activeTargetEmail);
-                    } else if (ACTION_PSWITCH_STOP.equals(action)) {
-                        remotePswitchToken = null;
-                        activeTargetEmail = null;
-                        logI("[" + currentPackage + "] PSwitch stopped -> cleared");
-                    } else if (ACTION_VENDING_SYNC.equals(action)) {
-                        Bundle tb = intent.getBundleExtra(EXTRA_TOKEN_BUNDLE);
-                        IBinder tok = getBinderCompat(tb, EXTRA_BINDER_KEY);
-                        if (tok != null) {
-                            remoteVendingToken = tok;
-                        }
-                        logI("[" + currentPackage + "] Play Store live sync received");
-                    } else if (ACTION_VENDING_STOP.equals(action)) {
-                        remoteVendingToken = null;
-                        logI("[" + currentPackage + "] Play Store stopped -> cleared");
-                    } else if (ACTION_PING_VENDING.equals(action) && isVendingProcess) {
-                        if (localVendingToken != null) {
-                            broadcastVendingLive(c);
-                        }
-                    } else if (ACTION_SET.equals(action)) {
-                        String email = intent.getStringExtra("email");
-                        if (email != null && email.trim().isEmpty()) {
-                            email = null;
-                        }
-                        activeTargetEmail = email;
+                        overrideTarget = email;
+                        hasOverride = true;
+                        cachedProvider = email;
+                        providerCached = true;
+                        writeTargetFile(email);
+                        logI("[" + currentPackage + "] Broadcast target -> " + overrideTarget);
                     } else if (ACTION_REQUEST.equals(action) && isVendingProcess) {
                         sendAccounts(c);
                     }
                 }
             };
             IntentFilter filter = new IntentFilter();
-            filter.addAction(ACTION_PSWITCH_SYNC);
-            filter.addAction(ACTION_PSWITCH_STOP);
-            filter.addAction(ACTION_VENDING_SYNC);
-            filter.addAction(ACTION_VENDING_STOP);
             filter.addAction(ACTION_SET);
             if (isVendingProcess) {
-                filter.addAction(ACTION_PING_VENDING);
                 filter.addAction(ACTION_REQUEST);
             }
-            registerReceiverCompat(ctx, receiver, filter);
-            logI("Target receivers registered in " + currentPackage);
+            try {
+                Method m = Context.class.getMethod("registerReceiver",
+                        BroadcastReceiver.class, IntentFilter.class, int.class);
+                m.invoke(ctx, receiver, filter, 2);
+            } catch (Throwable old) {
+                ctx.registerReceiver(receiver, filter);
+            }
+            logI("Receivers registered in " + currentPackage);
         } catch (Throwable t) {
-            logE("registerTargetReceivers failed: " + t);
+            logE("registerReceivers failed: " + t);
         }
     }
 
@@ -1416,40 +1045,143 @@ public class XposedInit extends XposedModule {
         return new Account(target, "com.google");
     }
 
-    private static void registerReceiverCompat(
-            Context ctx, BroadcastReceiver receiver, IntentFilter filter) {
+    static String readTarget() {
+        if (hasOverride) {
+            return overrideTarget;
+        }
+        String fromProvider = readProvider();
+        if (providerCached) {
+            return fromProvider;
+        }
+        return readFile();
+    }
+
+    private static String readProvider() {
+        if (appContext == null) {
+            return null;
+        }
+        Cursor c = null;
         try {
-            Method m = Context.class.getMethod("registerReceiver",
-                    BroadcastReceiver.class, IntentFilter.class, int.class);
-            m.invoke(ctx, receiver, filter, 2);
-        } catch (Throwable old) {
-            ctx.registerReceiver(receiver, filter);
+            c = appContext.getContentResolver().query(PROVIDER_URI, null, null, null, null);
+            if (c == null) {
+                return null;
+            }
+            if (!c.moveToFirst()) {
+                return null;
+            }
+            String email = null;
+            long version = 0;
+            int i = c.getColumnIndex("email");
+            if (i >= 0 && !c.isNull(i)) {
+                email = c.getString(i);
+            }
+            int v = c.getColumnIndex("version");
+            if (v >= 0) {
+                version = c.getLong(v);
+            }
+            if (email != null && email.trim().isEmpty()) {
+                email = null;
+            }
+            if (!providerCached || version != cachedVersion) {
+                cachedVersion = version;
+                cachedProvider = email;
+                providerCached = true;
+                writeTargetFile(email);
+            }
+            return cachedProvider;
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 
-    private static void putBinderCompat(Bundle b, String key, IBinder binder) {
-        if (b == null || binder == null) {
-            return;
+    private static File getTargetFile() {
+        if (appContext != null) {
+            try {
+                File dir = appContext.getFilesDir();
+                if (dir != null) {
+                    return new File(dir, TARGET_FILENAME);
+                }
+            } catch (Throwable ignored) {
+            }
         }
+        if (currentPackage != null && !currentPackage.isEmpty()) {
+            return new File("/data/data/" + currentPackage + "/files/" + TARGET_FILENAME);
+        }
+        return new File("/data/data/" + VENDING + "/files/" + TARGET_FILENAME);
+    }
+
+    private static void writeTargetFile(String email) {
+        FileOutputStream out = null;
         try {
-            Method m = Bundle.class.getMethod("putBinder", String.class, IBinder.class);
-            m.invoke(b, key, binder);
+            File f = getTargetFile();
+            if (email == null || email.indexOf('@') <= 0) {
+                if (f.exists()) {
+                    f.delete();
+                }
+                return;
+            }
+            File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs();
+            }
+            out = new FileOutputStream(f, false);
+            out.write(email.getBytes("UTF-8"));
+            out.flush();
         } catch (Throwable t) {
-            logW("putBinderCompat failed: " + t);
+            logW("writeTargetFile failed: " + t);
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 
-    private static IBinder getBinderCompat(Bundle b, String key) {
-        if (b == null) {
-            return null;
-        }
+    private static String readFile() {
+        FileInputStream in = null;
         try {
-            Method m = Bundle.class.getMethod("getBinder", String.class);
-            Object res = m.invoke(b, key);
-            return (res instanceof IBinder) ? (IBinder) res : null;
+            File f = getTargetFile();
+            if (!f.exists() || !f.isFile()) {
+                return null;
+            }
+            byte[] buf = new byte[(int) f.length()];
+            in = new FileInputStream(f);
+            int n = in.read(buf);
+            if (n <= 0) {
+                return null;
+            }
+            String s = new String(buf, 0, n, "UTF-8").trim();
+            return s.indexOf('@') > 0 ? s : null;
         } catch (Throwable t) {
             return null;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
+    }
+
+    private static void dumpClass(Class<?> c, String label) {
+        StringBuilder sb = new StringBuilder("dump " + label + ":");
+        for (Method m : c.getDeclaredMethods()) {
+            sb.append("\n  ").append(m.toString());
+        }
+        for (Field f : c.getDeclaredFields()) {
+            sb.append("\n  field ").append(f.getType().getName()).append(' ').append(f.getName());
+        }
+        logI(sb.toString());
     }
 
     private static XposedInterface.HookBuilder hookMethod(
