@@ -18,7 +18,6 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -53,7 +52,6 @@ public class XposedInit extends XposedModule {
     private static final String APP_PACKAGE = "io.github.ash_iir.pswitch";
     private static final String RESET_BTN_TAG = "pswitch_quick_reset_btn";
     private static final String TARGET_FILENAME = "pswitch_target.txt";
-    private static final long PROVIDER_SYNC_INTERVAL_MS = 5000L;
 
     private static final Uri PROVIDER_URI =
             Uri.parse("content://io.github.ash_iir.pswitch.provider/target");
@@ -73,15 +71,18 @@ public class XposedInit extends XposedModule {
 
     private static XposedInit self;
     private static Context appContext;
+    private static String currentProcess;
     private static String currentPackage;
     private static boolean isVendingProcess;
     private static boolean isPaidTasksProcess;
 
+    private static volatile boolean isStoreUiActive;
     private static volatile String currentTarget;
     private static volatile boolean targetLoaded;
     private static volatile long cachedVersion = -1L;
-    private static volatile long lastProviderSyncMs = 0L;
     private static volatile int lastRecordedAccountCount = -1;
+    private static volatile Account cachedIsolatedAccount;
+    private static volatile Account[] cachedIsolatedSingle;
 
     private static final ThreadLocal<Boolean> bypassAccountFilter = new ThreadLocal<>();
     private static final Set<String> knownGoogleEmails =
@@ -90,6 +91,7 @@ public class XposedInit extends XposedModule {
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
         self = this;
+        currentProcess = param.getProcessName();
     }
 
     @Override
@@ -98,16 +100,18 @@ public class XposedInit extends XposedModule {
         if (APP_PACKAGE.equals(pkg)) {
             return;
         }
+        // Bỏ qua tiến trình :background và :quick_launch của Play Store để tránh lag sync nền
+        if (VENDING.equals(pkg) && currentProcess != null && !VENDING.equals(currentProcess)) {
+            return;
+        }
+
         currentPackage = pkg;
         isVendingProcess = VENDING.equals(pkg);
         isPaidTasksProcess = PAID_TASKS.equals(pkg);
 
         hookApplication();
         hookAccountManager();
-        hookActivityLaunch();
-        if (isPaidTasksProcess) {
-            hookPaidTasksQuickReset();
-        }
+        hookActivityLifecycle();
     }
 
     private void hookApplication() {
@@ -122,7 +126,7 @@ public class XposedInit extends XposedModule {
                             if (app instanceof Context) {
                                 appContext = (Context) app;
                                 registerReceivers(appContext);
-                                initTargetAsync();
+                                initTargetOnce();
                             }
                             return res;
                         }
@@ -152,6 +156,9 @@ public class XposedInit extends XposedModule {
                         return raw;
                     }
                     recordKnownEmailsFast(raw);
+                    if (isVendingProcess && isStoreUiActive) {
+                        return raw;
+                    }
                     String target = getTargetFast();
                     if (target == null) {
                         return raw;
@@ -177,6 +184,9 @@ public class XposedInit extends XposedModule {
                         return raw;
                     }
                     recordKnownEmailsFast(raw);
+                    if (isVendingProcess && isStoreUiActive) {
+                        return raw;
+                    }
                     String target = getTargetFast();
                     if (target == null) {
                         return raw;
@@ -207,6 +217,9 @@ public class XposedInit extends XposedModule {
                         return raw;
                     }
                     recordKnownEmailsFast(raw);
+                    if (isVendingProcess && isStoreUiActive) {
+                        return raw;
+                    }
                     String target = getTargetFast();
                     if (target == null) {
                         return raw;
@@ -238,7 +251,13 @@ public class XposedInit extends XposedModule {
         for (int i = 0; i < original.length; i++) {
             Account a = original[i];
             if (a != null && "com.google".equals(a.type) && target.equalsIgnoreCase(a.name)) {
-                return new Account[]{a};
+                if (a == cachedIsolatedAccount && cachedIsolatedSingle != null) {
+                    return cachedIsolatedSingle;
+                }
+                Account[] single = new Account[]{a};
+                cachedIsolatedAccount = a;
+                cachedIsolatedSingle = single;
+                return single;
             }
         }
         return original;
@@ -266,6 +285,15 @@ public class XposedInit extends XposedModule {
         if (matched == null) {
             return original;
         }
+        if (nonGoogleCount == 0) {
+            if (matched == cachedIsolatedAccount && cachedIsolatedSingle != null) {
+                return cachedIsolatedSingle;
+            }
+            Account[] single = new Account[]{matched};
+            cachedIsolatedAccount = matched;
+            cachedIsolatedSingle = single;
+            return single;
+        }
         Account[] out = new Account[1 + nonGoogleCount];
         out[0] = matched;
         int pos = 1;
@@ -278,7 +306,7 @@ public class XposedInit extends XposedModule {
         return out;
     }
 
-    private void hookActivityLaunch() {
+    private void hookActivityLifecycle() {
         try {
             Method callOnCreate = Instrumentation.class.getDeclaredMethod(
                     "callActivityOnCreate", Activity.class, Bundle.class);
@@ -287,10 +315,8 @@ public class XposedInit extends XposedModule {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
                             Object arg0 = chain.getArg(0);
-                            Object arg1 = chain.getArg(1);
                             if (arg0 instanceof Activity) {
-                                handleActivityBeforeCreate((Activity) arg0,
-                                        arg1 instanceof Bundle ? (Bundle) arg1 : null);
+                                handleActivityBeforeCreate((Activity) arg0);
                             }
                             return chain.proceed();
                         }
@@ -308,10 +334,8 @@ public class XposedInit extends XposedModule {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
                             Object arg0 = chain.getArg(0);
-                            Object arg1 = chain.getArg(1);
                             if (arg0 instanceof Activity) {
-                                handleActivityBeforeCreate((Activity) arg0,
-                                        arg1 instanceof Bundle ? (Bundle) arg1 : null);
+                                handleActivityBeforeCreate((Activity) arg0);
                             }
                             return chain.proceed();
                         }
@@ -326,23 +350,92 @@ public class XposedInit extends XposedModule {
                     .intercept(new Hooker() {
                         @Override
                         public Object intercept(Chain chain) throws Throwable {
+                            Object arg0 = chain.getArg(0);
                             Object arg1 = chain.getArg(1);
-                            String target = getTargetFast();
-                            if (target != null && arg1 instanceof Intent) {
-                                patchIntent((Intent) arg1, target);
+                            if (arg0 instanceof Activity && arg1 instanceof Intent) {
+                                String clsName = arg0.getClass().getName();
+                                if (!isVendingProcess || isBillingActivity(clsName)) {
+                                    if (isVendingProcess) {
+                                        isStoreUiActive = false;
+                                    }
+                                    String target = getTargetFast();
+                                    if (target != null) {
+                                        patchIntent((Intent) arg1, target);
+                                    }
+                                }
                             }
                             return chain.proceed();
                         }
                     });
         } catch (Throwable ignored) {
         }
+
+        if (isVendingProcess || isPaidTasksProcess) {
+            try {
+                Method onResume = Instrumentation.class.getDeclaredMethod(
+                        "callActivityOnResume", Activity.class);
+                hookMethod(onResume).intercept(new Hooker() {
+                    @Override
+                    public Object intercept(Chain chain) throws Throwable {
+                        Object arg0 = chain.getArg(0);
+                        if (isVendingProcess && arg0 instanceof Activity) {
+                            isStoreUiActive = !isBillingActivity(arg0.getClass().getName());
+                        }
+                        Object res = chain.proceed();
+                        if (isPaidTasksProcess && arg0 instanceof Activity) {
+                            injectResetButton((Activity) arg0);
+                        }
+                        return res;
+                    }
+                });
+            } catch (Throwable t) {
+                logE("hook callActivityOnResume failed: " + t);
+            }
+        }
+
+        if (isVendingProcess) {
+            try {
+                Method onPause = Instrumentation.class.getDeclaredMethod(
+                        "callActivityOnPause", Activity.class);
+                hookMethod(onPause).intercept(new Hooker() {
+                    @Override
+                    public Object intercept(Chain chain) throws Throwable {
+                        Object arg0 = chain.getArg(0);
+                        if (arg0 instanceof Activity && !isBillingActivity(arg0.getClass().getName())) {
+                            isStoreUiActive = false;
+                        }
+                        return chain.proceed();
+                    }
+                });
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
-    private static void handleActivityBeforeCreate(Activity act, Bundle savedState) {
+    private static boolean isBillingActivity(String clsName) {
+        if (clsName == null) {
+            return false;
+        }
+        String low = clsName.toLowerCase();
+        return low.contains("billing")
+                || low.contains("acquire")
+                || low.contains("purchase")
+                || low.contains("checkout")
+                || low.contains("iab");
+    }
+
+    private static void handleActivityBeforeCreate(Activity act) {
         if (act == null) {
             return;
         }
-        maybeSyncProviderAsync();
+        String clsName = act.getClass().getName();
+        if (isVendingProcess) {
+            if (!isBillingActivity(clsName)) {
+                isStoreUiActive = true;
+                return;
+            }
+            isStoreUiActive = false;
+        }
         String target = getTargetFast();
         if (target == null) {
             return;
@@ -350,9 +443,6 @@ public class XposedInit extends XposedModule {
         Intent intent = act.getIntent();
         if (intent != null) {
             patchIntent(intent, target);
-        }
-        if (savedState != null) {
-            patchBundle(savedState, target);
         }
     }
 
@@ -428,29 +518,6 @@ public class XposedInit extends XposedModule {
             return false;
         }
         return knownGoogleEmails.contains(val.toLowerCase());
-    }
-
-    /**
-     * Nút nổi "Reset Acc" + popup đen xám bo góc cho Google Phần thưởng cho ý kiến.
-     */
-    private void hookPaidTasksQuickReset() {
-        try {
-            Method onResume = Instrumentation.class.getDeclaredMethod(
-                    "callActivityOnResume", Activity.class);
-            hookMethod(onResume).intercept(new Hooker() {
-                @Override
-                public Object intercept(Chain chain) throws Throwable {
-                    Object res = chain.proceed();
-                    Object arg0 = chain.getArg(0);
-                    if (arg0 instanceof Activity) {
-                        injectResetButton((Activity) arg0);
-                    }
-                    return res;
-                }
-            });
-        } catch (Throwable t) {
-            logE("hookPaidTasksQuickReset failed: " + t);
-        }
     }
 
     private static void injectResetButton(final Activity act) {
@@ -661,7 +728,8 @@ public class XposedInit extends XposedModule {
                         }
                         currentTarget = email;
                         targetLoaded = true;
-                        lastProviderSyncMs = SystemClock.elapsedRealtime();
+                        cachedIsolatedAccount = null;
+                        cachedIsolatedSingle = null;
                         writeTargetFileAsync(email);
                     } else if (ACTION_REQUEST.equals(action) && isVendingProcess) {
                         sendAccounts(c);
@@ -731,9 +799,6 @@ public class XposedInit extends XposedModule {
         return new Account(target, "com.google");
     }
 
-    /**
-     * Đọc cực nhanh từ RAM (không IPC, không đọc ổ đĩa lặp lại).
-     */
     private static String getTargetFast() {
         if (!targetLoaded) {
             currentTarget = readFile();
@@ -742,21 +807,11 @@ public class XposedInit extends XposedModule {
         return currentTarget;
     }
 
-    private static void initTargetAsync() {
-        // Nạp ngay từ file cục bộ vào RAM cho lần gọi đầu tiên
+    private static void initTargetOnce() {
         if (!targetLoaded) {
             currentTarget = readFile();
             targetLoaded = true;
         }
-        maybeSyncProviderAsync();
-    }
-
-    private static void maybeSyncProviderAsync() {
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastProviderSyncMs < PROVIDER_SYNC_INTERVAL_MS) {
-            return;
-        }
-        lastProviderSyncMs = now;
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -792,6 +847,8 @@ public class XposedInit extends XposedModule {
                 cachedVersion = version;
                 currentTarget = email;
                 targetLoaded = true;
+                cachedIsolatedAccount = null;
+                cachedIsolatedSingle = null;
                 writeTargetFile(email);
             }
         } catch (Throwable ignored) {
